@@ -20,16 +20,26 @@ async function performSearch() {
     error.classList.add('hidden');
     results.innerHTML = '';
     
-    // Tự động nhận diện nếu người dùng gõ chữ "Similar to: "
-    const isSimilarSearch = query.startsWith('Similar to:');
+    // Tự động nhận diện convention:
+    //   "Similar to: cat.xxxx.jpg"  → gọi /api/search-similar
+    //   "Material: cat.xxxx.jpg"    → gọi /api/search-similar-material
+    const isSimilarSearch  = query.startsWith('Similar to:');
+    const isMaterialSearch = query.startsWith('Material:');
     let endpoint = '/api/search';
     let reqBody = { query: query, top_k: 10 };
     let refImageId = null;
+    let searchType = 'text';
 
     if (isSimilarSearch) {
         refImageId = query.replace('Similar to:', '').trim();
-        endpoint = '/api/search-similar'; // Đẩy về api search-similar
-        reqBody = { image_id: refImageId, top_k: 10 };
+        endpoint   = '/api/search-similar';
+        reqBody    = { image_id: refImageId, top_k: 10 };
+        searchType = 'similar';
+    } else if (isMaterialSearch) {
+        refImageId = query.replace('Material:', '').trim();
+        endpoint   = '/api/search-similar-material';
+        reqBody    = { image_id: refImageId, top_k: 10 };
+        searchType = 'material';
     }
 
     try {
@@ -42,8 +52,8 @@ async function performSearch() {
         if (!response.ok) throw new Error('Search failed');
 
         const data = await response.json();
-        // Truyền thêm refImageId vào để hiển thị card tham chiếu
-        displayResults(data.results, refImageId);
+        // Truyền thêm refImageId và searchType vào để hiển thị card tham chiếu đúng loại
+        displayResults(data.results, refImageId, searchType);
     } catch (err) {
         showError('Search failed: ' + err.message);
     } finally {
@@ -79,7 +89,38 @@ async function findSimilar(e) {
     }
 }
 
-function displayResults(items, referenceImageId = null) {
+async function findMaterial(e) {
+    const imageId = e.target.dataset.imageId;
+
+    loading.classList.remove('hidden');
+    error.classList.add('hidden');
+    results.innerHTML = '';
+
+    try {
+        const response = await fetch('/api/search-similar-material', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_id: imageId, top_k: 10 })
+        });
+
+        if (!response.ok) {
+            const errData = await response.json().catch(() => ({}));
+            throw new Error(errData.error || 'Material search failed');
+        }
+
+        const data = await response.json();
+        searchInput.value = `Material: ${imageId}`;
+
+        // Truyền referenceImageId và badge loại 'material'
+        displayResults(data.results, imageId, 'material');
+    } catch (err) {
+        showError('Material search failed: ' + err.message);
+    } finally {
+        loading.classList.add('hidden');
+    }
+}
+
+function displayResults(items, referenceImageId = null, searchType = 'similar') {
     results.innerHTML = '';
 
     if (items.length === 0) {
@@ -105,6 +146,9 @@ function displayResults(items, referenceImageId = null) {
     items.forEach(item => {
         const card = document.createElement('div');
         card.className = 'result-card';
+
+        const badgeLabel = searchType === 'material' ? 'Find Material' : 'Find Similar';
+        const badgeClass = searchType === 'material' ? 'find-material-btn' : 'find-similar-btn';
         
         card.innerHTML = `
             <img src="${item.image_url}" alt="${item.image_id}">
@@ -112,7 +156,10 @@ function displayResults(items, referenceImageId = null) {
                 <div class="rank">Rank #${item.rank}</div>
                 <div class="score">Score: ${item.score.toFixed(4)}</div>
                 <div class="image-id">${item.image_id}</div>
-                <button class="find-similar-btn" data-image-id="${item.image_id}">Find Similar</button>
+                <div class="action-buttons">
+                    <button class="find-similar-btn" data-image-id="${item.image_id}">Find Similar</button>
+                    <button class="find-material-btn" data-image-id="${item.image_id}">Find Material</button>
+                </div>
             </div>
         `;
         
@@ -122,6 +169,9 @@ function displayResults(items, referenceImageId = null) {
     // Cập nhật lại event listener cho các nút mới
     document.querySelectorAll('.find-similar-btn').forEach(btn => {
         btn.addEventListener('click', findSimilar);
+    });
+    document.querySelectorAll('.find-material-btn').forEach(btn => {
+        btn.addEventListener('click', findMaterial);
     });
 }
 

@@ -23,6 +23,8 @@ siglip_files = sorted(DATA_DIR.glob("siglip2_embeddings_*.hdf5"), reverse=True)
 siglip_indices = sorted(DATA_DIR.glob("siglip2_faiss_index_*.pkl"), reverse=True)
 dinov3_files = sorted(DATA_DIR.glob("dinov3_embeddings_*.hdf5"), reverse=True)
 dinov3_indices = sorted(DATA_DIR.glob("dinov3_faiss_index_*.pkl"), reverse=True)
+dinov3_dense_files = sorted(DATA_DIR.glob("dinov3_dense_embeddings_*.hdf5"), reverse=True)
+dinov3_dense_indices = sorted(DATA_DIR.glob("dinov3_dense_faiss_index_*.pkl"), reverse=True)
 
 if not siglip_files or not siglip_indices:
     raise FileNotFoundError(f"SigLIP2 embeddings not found in {DATA_DIR}/")
@@ -53,6 +55,24 @@ if dinov3_files and dinov3_indices:
     print(f"Loaded {len(dinov3_ids)} images for image search")
 else:
     print("DINOv3 embeddings not found, image similarity search disabled")
+
+# --- DINOv3 Dense (material / texture similarity) ---
+dinov3_dense_embedding_file = None
+dinov3_dense_index = None
+dinov3_dense_ids = []
+dinov3_dense_id_to_idx = {}
+
+if dinov3_dense_files and dinov3_dense_indices:
+    print(f"Loading DINOv3 Dense from {dinov3_dense_files[0].name}...")
+    dinov3_dense_embedding_file = dinov3_dense_files[0]
+    with h5py.File(dinov3_dense_embedding_file, 'r') as f:
+        dinov3_dense_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
+    with open(dinov3_dense_indices[0], 'rb') as f:
+        dinov3_dense_index = pickle.load(f)
+    dinov3_dense_id_to_idx = {img_id: idx for idx, img_id in enumerate(dinov3_dense_ids)}
+    print(f"Loaded {len(dinov3_dense_ids)} images for material/texture search")
+else:
+    print("DINOv3 Dense embeddings not found, material similarity search disabled")
 
 print("Loading SigLIP 2 model...")
 processor = AutoProcessor.from_pretrained(MODEL_ID)
@@ -149,6 +169,49 @@ def search_similar():
             break
     
     return jsonify({'results': results})
+
+@app.route('/api/search-similar-material', methods=['POST'])
+def search_similar_material():
+    """Material / texture similarity using DINOv3 dense patch-mean features."""
+    if dinov3_dense_index is None:
+        return jsonify({'error': 'Material similarity search not available (DINOv3 Dense embeddings not loaded)'}), 503
+
+    data = request.json
+    image_id = data.get('image_id', '')
+    top_k = data.get('top_k', 10)
+
+    if not image_id:
+        return jsonify({'error': 'image_id is required'}), 400
+
+    if image_id not in dinov3_dense_id_to_idx:
+        return jsonify({'error': 'Image not found in dense index'}), 404
+
+    idx = dinov3_dense_id_to_idx[image_id]
+
+    # Lazy-load only the single query embedding (memory efficient)
+    with h5py.File(dinov3_dense_embedding_file, 'r') as f:
+        query_embedding = f['embeddings'][idx:idx+1]
+
+    scores, indices = dinov3_dense_index.search(query_embedding.astype(np.float32), top_k + 1)
+
+    results = []
+    for rank, (res_idx, score) in enumerate(zip(indices[0], scores[0])):
+        result_id = dinov3_dense_ids[res_idx]
+        if result_id == image_id:
+            continue
+
+        img_relative = f"dataset/test_set/cats/{result_id}"
+        results.append({
+            'rank': len(results) + 1,
+            'image_id': result_id,
+            'image_url': f"/images/{img_relative}",
+            'score': float(score)
+        })
+        if len(results) >= top_k:
+            break
+
+    return jsonify({'results': results})
+
 
 @app.route('/images/<path:filepath>')
 def serve_image(filepath):

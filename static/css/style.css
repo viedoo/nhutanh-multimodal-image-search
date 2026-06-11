@@ -133,20 +133,42 @@ header p {
     word-break: break-all;
 }
 
-.find-similar-btn {
-    width: 100%;
-    padding: 8px;
-    background: #667eea;
+/* Action buttons container */
+.action-buttons {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.find-similar-btn,
+.find-material-btn {
+    flex: 1;
+    padding: 8px 4px;
     color: white;
     border: none;
     border-radius: 5px;
     cursor: pointer;
-    font-size: 0.9rem;
-    transition: background 0.3s;
+    font-size: 0.82rem;
+    font-weight: 600;
+    transition: background 0.25s, transform 0.15s;
 }
 
+/* Find Similar – teal/blue (DINOv3 global CLS) */
+.find-similar-btn {
+    background: #667eea;
+}
 .find-similar-btn:hover {
     background: #5568d3;
+    transform: translateY(-1px);
+}
+
+/* Find Material – purple (DINOv3 dense patch-mean) */
+.find-material-btn {
+    background: linear-gradient(135deg, #9b59b6, #8e44ad);
+}
+.find-material-btn:hover {
+    background: linear-gradient(135deg, #8e44ad, #6c3483);
+    transform: translateY(-1px);
 }
 
 .reference-card {

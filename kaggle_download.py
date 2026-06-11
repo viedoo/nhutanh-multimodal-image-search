@@ -13,20 +13,28 @@ def download_outputs(api, kernel_slug, notebook_type):
     """Download outputs from completed kernel"""
     temp_dir = Path(f"./temp_output_{notebook_type}")
     temp_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Downloading outputs from {kernel_slug}...")
-    
+
+    # Step 1: Download – a UnicodeEncodeError on Windows is expected when Kaggle
+    # tries to write the notebook log (which may contain UTF-8 chars like ✓).
+    # Binary output files (.hdf5 / .pkl) are downloaded BEFORE the log, so we
+    # catch the encoding error and continue with whatever landed in temp_dir.
     try:
-        # Use API to download outputs
         api.kernels_output_cli(kernel_slug, path=str(temp_dir))
-        
-        # Move files to result/
+    except UnicodeEncodeError:
+        print("  (Log file has non-ASCII chars – skipping log, continuing with binary outputs)")
+    except Exception as e:
+        print(f"  Warning during download: {e}")
+
+    # Step 2: Move downloaded binary files to result/ regardless of log errors
+    try:
         result_dir = Path("./result")
         result_dir.mkdir(parents=True, exist_ok=True)
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         moved = 0
-        
+
         for f in temp_dir.glob("*"):
             if f.is_file() and f.suffix != ".log":
                 # Determine target filename
@@ -38,22 +46,22 @@ def download_outputs(api, kernel_slug, notebook_type):
                     new_name = f"{notebook_type}_{f.stem}_{timestamp}{f.suffix}"
                 else:
                     continue
-                
+
                 dest = result_dir / new_name
                 shutil.move(str(f), str(dest))
                 size_mb = dest.stat().st_size / 1024**2
-                print(f"  ✓ {new_name} ({size_mb:.2f} MB)")
+                print(f"  [OK] {new_name} ({size_mb:.2f} MB)")
                 moved += 1
-        
+
         if moved == 0:
-            print(f"  ⚠ No output files found (only logs)")
+            print("  No output files found (only logs)")
             return False
-        
-        print(f"\n✓ Downloaded {moved} files to result/")
+
+        print(f"\n[OK] Downloaded {moved} files to result/")
         return True
-        
+
     except Exception as e:
-        print(f"✗ Download error: {e}")
+        print(f"  Download error: {e}")
         return False
     finally:
         if temp_dir.exists():
@@ -61,7 +69,7 @@ def download_outputs(api, kernel_slug, notebook_type):
 
 def main():
     parser = argparse.ArgumentParser(description="Download Kaggle kernel outputs")
-    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3"],
+    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3", "dinov3_dense"],
                        help="Notebook type")
     parser.add_argument("--check-status", action="store_true",
                        help="Check kernel status before downloading")
@@ -72,12 +80,14 @@ def main():
     api = KaggleApi()
     api.authenticate()
     username = api.get_config_value('username')
-    kernel_slug = f"{username}/{args.type}-embed"
+    # Kaggle slug không cho phép '_' → thay bằng '-'
+    slug_name = args.type.replace("_", "-")
+    kernel_slug = f"{username}/{slug_name}-embed"
     
     # Check tracking file if exists
     tracking_file = Path(f"./temp_kernel_{args.type}_version.json")
     if tracking_file.exists():
-        with open(tracking_file, 'r') as f:
+        with open(tracking_file, 'r', encoding='utf-8') as f:
             tracking_data = json.load(f)
         print(f"Found tracking data:")
         print(f"  Version: {tracking_data.get('version_number')}")

@@ -27,28 +27,33 @@ def push_notebook(api, notebook_type, dataset_slug, username):
     kernel_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # Copy notebook
-        notebook_src = Path(f"./notebook/{notebook_type}-embed.ipynb")
-        if not notebook_src.exists():
-            notebook_src = Path(f"./notebook/{'dino-v3' if notebook_type == 'dinov3' else 'siglip2'}-embed.ipynb")
-        
+        # Copy notebook – map logical type → actual filename
+        _notebook_name_map = {
+            "dinov3":       "dino-v3-embed.ipynb",
+            "dinov3_dense": "dino-v3-dense-embed.ipynb",
+            "siglip2":      "siglip2-embed.ipynb",
+        }
+        notebook_src = Path(f"./notebook/{_notebook_name_map.get(notebook_type, notebook_type + '-embed.ipynb')}") 
         if not notebook_src.exists():
             raise FileNotFoundError(f"Notebook not found: {notebook_src}")
         
-        shutil.copy(notebook_src, kernel_dir / f"{notebook_type}-embed.ipynb")
-        
-        kernel_slug = f"{username}/{notebook_type}-embed"
-        
+        # Kaggle slug chỉ cho phép chữ thường, số và dấu '-' (không cho '_')
+        slug_name = notebook_type.replace("_", "-")  # e.g. dinov3_dense → dinov3-dense
+        code_filename = f"{slug_name}-embed.ipynb"
+        shutil.copy(notebook_src, kernel_dir / code_filename)
+
+        kernel_slug = f"{username}/{slug_name}-embed"
+
         # Create metadata (accelerator set in .ipynb file, not here)
         dataset_sources = [dataset_slug]
-        # Add private secrets dataset for dinov3 (requires HF_TOKEN)
-        if notebook_type == "dinov3":
+        # Add private secrets dataset for dinov3 / dinov3_dense (requires HF_TOKEN)
+        if notebook_type in ("dinov3", "dinov3_dense"):
             dataset_sources.append(f"{username}/my-hf-secrets")
-        
+
         metadata = {
             "id": kernel_slug,
-            "title": f"{notebook_type.upper()} Embed",
-            "code_file": f"{notebook_type}-embed.ipynb",
+            "title": f"{slug_name.upper()} Embed",
+            "code_file": code_filename,
             "language": "python",
             "kernel_type": "notebook",
             "is_private": True,
@@ -189,24 +194,31 @@ def download_outputs(api, tracking_data):
     """Download outputs from completed kernel"""
     kernel_slug = tracking_data['kernel_slug']
     notebook_type = tracking_data['notebook_type']
-    username = kernel_slug.split('/')[0]
-    
+
     temp_dir = Path(f"./temp_output_{notebook_type}")
     temp_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"\n[DOWNLOAD] Downloading outputs from {kernel_slug}...")
-    
+
+    # Step 1: Download – UnicodeEncodeError on Windows is expected when Kaggle
+    # writes the notebook log (stdout may contain UTF-8 chars like checkmarks).
+    # Binary files (.hdf5 / .pkl) are downloaded BEFORE the log, so we catch
+    # the encoding error and proceed with whatever landed in temp_dir.
     try:
-        # Use API to download outputs
         api.kernels_output_cli(kernel_slug, path=str(temp_dir))
-        
-        # Move files to result/
+    except UnicodeEncodeError:
+        print("  (Log file has non-ASCII chars - skipping log, continuing with binary outputs)")
+    except Exception as e:
+        print(f"  Warning during download: {e}")
+
+    # Step 2: Move downloaded binary files to result/ regardless of log errors
+    try:
         result_dir = Path("./result")
         result_dir.mkdir(parents=True, exist_ok=True)
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         moved = 0
-        
+
         for f in temp_dir.glob("*"):
             if f.is_file() and f.suffix != ".log":
                 # Determine target filename
@@ -215,27 +227,26 @@ def download_outputs(api, tracking_data):
                 elif "faiss" in f.name.lower() and f.suffix in [".bin", ".pkl"]:
                     new_name = f"{notebook_type}_faiss_index_{timestamp}{f.suffix}"
                 elif f.suffix in [".npz", ".hdf5", ".bin", ".pkl"]:
-                    # Generic embedding/index files
                     new_name = f"{notebook_type}_{f.stem}_{timestamp}{f.suffix}"
                 else:
                     continue
-                
+
                 dest = result_dir / new_name
                 shutil.move(str(f), str(dest))
                 size_mb = dest.stat().st_size / 1024**2
-                print(f"  ✓ {new_name} ({size_mb:.2f} MB)")
+                print(f"  [OK] {new_name} ({size_mb:.2f} MB)")
                 moved += 1
-        
+
         if moved == 0:
-            print(f"  ⚠ No output files found (only logs)")
-            print(f"  Check if kernel generated outputs: https://www.kaggle.com/code/{kernel_slug}")
+            print(f"  No output files found (only logs)")
+            print(f"  Check: https://www.kaggle.com/code/{kernel_slug}")
             return False
-        
-        print(f"  ✓ Downloaded {moved} files to result/")
+
+        print(f"  [OK] Downloaded {moved} files to result/")
         return True
-        
+
     except Exception as e:
-        print(f"  ✗ Download error: {e}")
+        print(f"  Download error: {e}")
         return False
     finally:
         # Cleanup
@@ -246,7 +257,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Unified Kaggle Pipeline with proper version tracking"
     )
-    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3"],
+    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3", "dinov3_dense"],
                        help="Notebook type to run")
     parser.add_argument("--dataset", default="chetankv/dogs-cats-images",
                        help="Kaggle dataset slug")
