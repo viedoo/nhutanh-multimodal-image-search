@@ -1,3 +1,1 @@
-# Result directory for Kaggle pipeline outputs
-# Files: {notebook_type}_embeddings_{timestamp}.npz
-# Files: {notebook_type}_faiss_index_{timestamp}.bin
+# Keep this directory in git

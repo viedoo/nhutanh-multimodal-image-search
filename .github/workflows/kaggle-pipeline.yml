@@ -59,15 +59,16 @@ jobs:
       
       - name: Run Kaggle pipeline
         run: |
-          python kaggle_pipeline_v2.py \
+          python kaggle_pipeline.py \
             --type ${{ steps.notebook.outputs.type }} \
-            --dataset ${{ steps.notebook.outputs.dataset }}
+            --dataset ${{ steps.notebook.outputs.dataset }} \
+            --auto-download
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: embeddings-${{ steps.notebook.outputs.type }}
-          path: data/
+          path: result/
           retention-days: 7
       
       - name: Commit results (optional)
@@ -75,7 +76,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
+          git add result/
           git diff --staged --quiet || git commit -m "chore: update embeddings from ${{ steps.notebook.outputs.type }}"
           # Uncomment to auto-push:
           # git push

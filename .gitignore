@@ -16,10 +16,13 @@ data/kaggle_outputs/
 # Kaggle pipeline temporary files
 temp_kernel_*/
 temp_output_*/
+temp_kernel_*_version.json
 kernels/
 
 # Result files (keep folder but ignore large files)
 result/*.npz
+result/*.hdf5
+result/*.pkl
 result/*.bin
 result/*.log
 
@@ -61,6 +64,10 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Environment variables (secrets)
+.env
+secrets/
 
 # Logs
 *.log

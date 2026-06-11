@@ -1,9 +1,0 @@
-flask
-flask-cors
-numpy
-faiss-cpu
-torch
-torchvision
-transformers
-Pillow
-tqdm

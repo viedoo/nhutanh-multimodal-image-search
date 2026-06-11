@@ -1,36 +1,58 @@
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_cors import CORS
+from functools import lru_cache
 import numpy as np
-import faiss
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor
 from pathlib import Path
-import os
+import h5py
+import pickle
 
 app = Flask(__name__)
 CORS(app)
 
 MODEL_ID = "google/siglip2-base-patch16-naflex"
-DATA_DIR = "data"
-DATASET_ROOT = Path("F:/Documents 1/Programing/test_kaggle/dataset")
+DATA_DIR = Path("result")
+DATASET_ROOT = Path(__file__).parent / "dataset"
 
-print("Loading SigLIP 2 embeddings and index...")
-data = np.load(f"{DATA_DIR}/embeddings.npz", allow_pickle=True)
-image_ids = data['image_ids'].tolist()
-image_paths = data['image_paths'].tolist()
-siglip_index = faiss.read_index(f"{DATA_DIR}/faiss_index.bin")
+print("Loading embeddings and indices...")
+
+# Find latest embedding files (HDF5 format)
+siglip_files = sorted(DATA_DIR.glob("siglip2_embeddings_*.hdf5"), reverse=True)
+siglip_indices = sorted(DATA_DIR.glob("siglip2_faiss_index_*.pkl"), reverse=True)
+dinov3_files = sorted(DATA_DIR.glob("dinov3_embeddings_*.hdf5"), reverse=True)
+dinov3_indices = sorted(DATA_DIR.glob("dinov3_faiss_index_*.pkl"), reverse=True)
+
+if not siglip_files or not siglip_indices:
+    raise FileNotFoundError(f"SigLIP2 embeddings not found in {DATA_DIR}/")
+
+print(f"Loading SigLIP 2 from {siglip_files[0].name}...")
+with h5py.File(siglip_files[0], 'r') as f:
+    image_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
+    image_paths = [s.decode('utf-8') for s in f['image_paths'][:]]
+with open(siglip_indices[0], 'rb') as f:
+    siglip_index = pickle.load(f)
 print(f"Loaded {len(image_ids)} images for text search")
 
-print("Loading DINOv3 embeddings and index...")
-dinov3_data = np.load(f"{DATA_DIR}/dinov3_embeddings.npz", allow_pickle=True)
-dinov3_embeddings = dinov3_data['embeddings']
-dinov3_ids = dinov3_data['image_ids'].tolist()
-dinov3_index = faiss.read_index(f"{DATA_DIR}/dinov3_faiss_index.bin")
-print(f"Loaded {len(dinov3_ids)} images for image search")
+# Keep file paths for lazy loading (memory optimization for large datasets)
+siglip_embedding_file = siglip_files[0]
+dinov3_embedding_file = None
+dinov3_index = None
+dinov3_ids = []
+dinov3_id_to_idx = {}
 
-# Create mapping from image_id to dinov3 embedding index
-dinov3_id_to_idx = {img_id: idx for idx, img_id in enumerate(dinov3_ids)}
+if dinov3_files and dinov3_indices:
+    print(f"Loading DINOv3 from {dinov3_files[0].name}...")
+    dinov3_embedding_file = dinov3_files[0]
+    with h5py.File(dinov3_embedding_file, 'r') as f:
+        dinov3_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
+    with open(dinov3_indices[0], 'rb') as f:
+        dinov3_index = pickle.load(f)
+    dinov3_id_to_idx = {img_id: idx for idx, img_id in enumerate(dinov3_ids)}
+    print(f"Loaded {len(dinov3_ids)} images for image search")
+else:
+    print("DINOv3 embeddings not found, image similarity search disabled")
 
 print("Loading SigLIP 2 model...")
 processor = AutoProcessor.from_pretrained(MODEL_ID)
@@ -39,14 +61,21 @@ model.eval()
 device = "cpu"
 print("SigLIP 2 model loaded and ready!")
 
-def embed_text(text: str) -> np.ndarray:
+@lru_cache(maxsize=1000)
+def embed_text_cached(text: str) -> tuple:
+    """Cache text embeddings to avoid re-computing (LRU cache optimization)"""
     inputs = processor(text=[text], return_tensors="pt", padding="max_length", max_length=64, truncation=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model.get_text_features(**inputs)
         text_features = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs
         text_features = F.normalize(text_features, p=2, dim=-1)
-    return text_features.cpu().numpy()
+    return tuple(text_features.cpu().numpy().flatten().tolist())
+
+def embed_text(text: str) -> np.ndarray:
+    """Convert cached tuple back to numpy array"""
+    cached = embed_text_cached(text)
+    return np.array(cached, dtype=np.float32).reshape(1, -1)
 
 print("Ready for searches!")
 
@@ -82,6 +111,9 @@ def search():
 
 @app.route('/api/search-similar', methods=['POST'])
 def search_similar():
+    if dinov3_index is None:
+        return jsonify({'error': 'Image similarity search not available'}), 503
+    
     data = request.json
     image_id = data.get('image_id', '')
     top_k = data.get('top_k', 10)
@@ -93,7 +125,10 @@ def search_similar():
         return jsonify({'error': 'Image not found'}), 404
     
     idx = dinov3_id_to_idx[image_id]
-    query_embedding = dinov3_embeddings[idx:idx+1]
+    
+    # Lazy load only the needed embedding (memory optimization for large datasets)
+    with h5py.File(dinov3_embedding_file, 'r') as f:
+        query_embedding = f['embeddings'][idx:idx+1]
     
     scores, indices = dinov3_index.search(query_embedding.astype(np.float32), top_k + 1)
     
