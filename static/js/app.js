@@ -132,7 +132,7 @@ function displayResults(items, referenceImageId = null, searchType = 'similar') 
         refCard.className = 'result-card reference-card'; // Tái sử dụng form của result-card
         refCard.innerHTML = `
             <div class="reference-header">Reference Image</div>
-            <img src="/images/dataset/test_set/cats/${referenceImageId}" alt="${referenceImageId}">
+            <img src="/images/animals/${referenceImageId}" alt="${referenceImageId}">
             <div class="result-info">
                 <div class="image-id" style="color: #333; font-weight: bold; font-size: 0.95rem;">ID: ${referenceImageId}</div>
             </div>

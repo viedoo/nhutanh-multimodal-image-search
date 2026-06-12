@@ -13,7 +13,7 @@ on:
       dataset_slug:
         description: 'Kaggle dataset slug'
         required: true
-        default: 'chetankv/dogs-cats-images'
+        default: 'your-username/dataset'
   push:
     paths:
       - 'notebook/**'
@@ -60,14 +60,14 @@ jobs:
           else
             # Default to siglip2 for push events
             echo "type=siglip2" >> $GITHUB_OUTPUT
-            echo "dataset=chetankv/dogs-cats-images" >> $GITHUB_OUTPUT
+            echo "dataset=your-username/dataset" >> $GITHUB_OUTPUT
           fi
       
       - name: Run Kaggle pipeline
         run: |
           python kaggle_pipeline.py \
             --type ${{ steps.notebook.outputs.type }} \
-            --dataset ${{ steps.notebook.outputs.dataset }} \
+            --upload-dataset dataset \
             --auto-download
       
       - name: Upload artifacts

@@ -38,10 +38,14 @@ with open(siglip_indices[0], 'rb') as f:
 print(f"Loaded {len(image_ids)} images for text search")
 
 # Build id→relative-path lookup from SigLIP metadata (shared across all endpoints)
-id_to_path = {
-    img_id: img_path.split('dogs-cats-images/')[-1]
-    for img_id, img_path in zip(image_ids, image_paths)
-}
+# image_ids are stored as 'cat/001.jpg' but actual files are under 'animals/cat/001.jpg'
+# Prepend 'animals/' if the path doesn't already start with it
+def _make_rel_path(img_id: str) -> str:
+    if img_id.startswith("animals/"):
+        return img_id
+    return f"animals/{img_id}"
+
+id_to_path = {img_id: _make_rel_path(img_id) for img_id in image_ids}
 
 # Keep file paths for lazy loading (memory optimization for large datasets)
 siglip_embedding_file = siglip_files[0]
@@ -123,12 +127,11 @@ def search():
     
     results = []
     for rank, (idx, score) in enumerate(zip(indices[0], scores[0])):
-        # image_paths[idx] = /kaggle/input/datasets/chetankv/dogs-cats-images/dataset/test_set/cats/cat.4085.jpg
-        # Need: dataset/test_set/cats/cat.4085.jpg
-        img_relative = image_paths[idx].split('dogs-cats-images/')[-1]
+        img_id = image_ids[idx]
+        img_relative = id_to_path.get(img_id, _make_rel_path(img_id))
         results.append({
             'rank': rank + 1,
-            'image_id': image_ids[idx],
+            'image_id': img_id,
             'image_url': f"/images/{img_relative}",
             'score': float(score)
         })
@@ -164,7 +167,7 @@ def search_similar():
         if result_id == image_id:
             continue
 
-        img_relative = id_to_path.get(result_id, f"dataset/test_set/cats/{result_id}")
+        img_relative = id_to_path.get(result_id, result_id)
         results.append({
             'rank': len(results) + 1,
             'image_id': result_id,
@@ -206,7 +209,7 @@ def search_similar_material():
         if result_id == image_id:
             continue
 
-        img_relative = id_to_path.get(result_id, f"dataset/test_set/cats/{result_id}")
+        img_relative = id_to_path.get(result_id, result_id)
         results.append({
             'rank': len(results) + 1,
             'image_id': result_id,
@@ -221,10 +224,7 @@ def search_similar_material():
 
 @app.route('/images/<path:filepath>')
 def serve_image(filepath):
-    # filepath = dataset/test_set/cats/cat.4414.jpg
-    # DATASET_ROOT already includes 'dataset', so strip it from filepath
-    if filepath.startswith('dataset/'):
-        filepath = filepath[8:]  # Remove 'dataset/' prefix
+    # filepath is relative to DATASET_ROOT (e.g., 'animals/cat/001.jpg')
     full_path = DATASET_ROOT / filepath
     if not full_path.exists():
         return jsonify({'error': 'Image not found'}), 404
