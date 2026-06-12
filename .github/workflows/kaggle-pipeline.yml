@@ -1,5 +1,9 @@
 name: Kaggle Embedding Pipeline
 
+# Dataset ảnh phải được upload lên Kaggle thủ công 1 lần trước:
+#   uv run python kaggle_dataset.py --folder dataset
+# Sau đó workflow này chỉ push notebook + chạy GPU + tải embedding về.
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,32 +14,29 @@ on:
         options:
           - siglip2
           - dinov3
+          - dinov3_dense
       dataset_slug:
-        description: 'Kaggle dataset slug'
+        description: 'Kaggle dataset slug (must already exist on Kaggle)'
         required: true
-        default: 'your-username/dataset'
-  push:
-    paths:
-      - 'notebook/**'
-      - '.github/workflows/kaggle-pipeline.yml'
+        default: 'anhpham2710/dataset'
 
 jobs:
   run-kaggle-pipeline:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
-          pip install kaggle
-      
+          pip install kaggle h5py faiss-cpu numpy
+
       - name: Setup Kaggle credentials
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
@@ -43,46 +44,24 @@ jobs:
         run: |
           if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
             echo "Error: KAGGLE_USERNAME or KAGGLE_KEY secret is not set"
-            echo "Please set these secrets in repository settings: Settings > Secrets > Actions"
+            echo "Go to: Settings > Secrets and variables > Actions"
             exit 1
           fi
           mkdir -p ~/.kaggle
           echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
           echo "Kaggle credentials configured for user: $KAGGLE_USERNAME"
-      
-      - name: Determine notebook type
-        id: notebook
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "type=${{ inputs.notebook_type }}" >> $GITHUB_OUTPUT
-            echo "dataset=${{ inputs.dataset_slug }}" >> $GITHUB_OUTPUT
-          else
-            # Default to siglip2 for push events
-            echo "type=siglip2" >> $GITHUB_OUTPUT
-            echo "dataset=your-username/dataset" >> $GITHUB_OUTPUT
-          fi
-      
+
       - name: Run Kaggle pipeline
         run: |
           python kaggle_pipeline.py \
-            --type ${{ steps.notebook.outputs.type }} \
-            --upload-dataset dataset \
+            --type ${{ inputs.notebook_type }} \
+            --dataset-slug ${{ inputs.dataset_slug }} \
             --auto-download
-      
-      - name: Upload artifacts
+
+      - name: Upload embeddings as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: embeddings-${{ steps.notebook.outputs.type }}
+          name: embeddings-${{ inputs.notebook_type }}
           path: result/
           retention-days: 7
-      
-      - name: Commit results (optional)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add result/
-          git diff --staged --quiet || git commit -m "chore: update embeddings from ${{ steps.notebook.outputs.type }}"
-          # Uncomment to auto-push:
-          # git push
