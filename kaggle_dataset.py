@@ -9,6 +9,9 @@ Usage:
 This creates or updates a Kaggle dataset so notebooks can mount it via
 dataset_sources in kernel-metadata.json.
 """
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import argparse
 import json
 from pathlib import Path
@@ -114,7 +117,7 @@ def upload_dataset(api, folder, slug=None, public=False, version_notes="Updated 
         # Try updating existing dataset first
         print(f"\n  Uploading to Kaggle (tarball mode for nested folders)...")
         api.dataset_create_version(str(folder), version_notes, dir_mode='tar')
-        print(f"  ✓ Dataset version created successfully!")
+        print(f"  [OK] Dataset version created successfully!")
         print(f"    URL: https://www.kaggle.com/datasets/{slug}")
         return slug
 
@@ -126,7 +129,7 @@ def upload_dataset(api, folder, slug=None, public=False, version_notes="Updated 
             print(f"  Dataset not found, creating new...")
             try:
                 api.dataset_create_new(str(folder), dir_mode='tar')
-                print(f"  ✓ Dataset created successfully!")
+                print(f"  [OK] Dataset created successfully!")
                 print(f"    URL: https://www.kaggle.com/datasets/{slug}")
                 return slug
             except Exception as e2:
@@ -175,11 +178,11 @@ def main():
         slug = upload_dataset(
             api, args.folder, args.slug, args.public, args.version_notes
         )
-        print(f"\n✓ Dataset uploaded successfully!")
+        print(f"\n[OK] Dataset uploaded successfully!")
         print(f"  Use this slug in kaggle_pipeline.py: --dataset {slug}")
         return 0
     except Exception as e:
-        print(f"\n✗ Upload failed: {e}")
+        print(f"\n[FAIL] Upload failed: {e}")
         return 1
 
 

@@ -2,6 +2,9 @@
 Enhanced download script compatible with unified pipeline
 Supports both manual download and auto-retry with tracking
 """
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import argparse
 import json
 from pathlib import Path
@@ -16,14 +19,14 @@ def download_outputs(api, kernel_slug, notebook_type):
 
     print(f"Downloading outputs from {kernel_slug}...")
 
-    # Step 1: Download – a UnicodeEncodeError on Windows is expected when Kaggle
-    # tries to write the notebook log (which may contain UTF-8 chars like ✓).
+    # Step 1: Download - a UnicodeEncodeError on Windows is expected when Kaggle
+    # tries to write the notebook log (which may contain UTF-8 chars).
     # Binary output files (.hdf5 / .pkl) are downloaded BEFORE the log, so we
     # catch the encoding error and continue with whatever landed in temp_dir.
     try:
         api.kernels_output_cli(kernel_slug, path=str(temp_dir))
     except UnicodeEncodeError:
-        print("  (Log file has non-ASCII chars – skipping log, continuing with binary outputs)")
+        print("  (Log file has non-ASCII chars - skipping log, continuing with binary outputs)")
     except Exception as e:
         print(f"  Warning during download: {e}")
 
@@ -110,7 +113,7 @@ def main():
             print(f"  Status: {current_status}")
             
             if current_status != 'complete':
-                print(f"\n⚠ Kernel is not complete yet ({current_status})")
+                print(f"\n[WARN] Kernel is not complete yet ({current_status})")
                 print(f"  Check: https://www.kaggle.com/code/{kernel_slug}")
                 return 1
         except Exception as e:

@@ -1,190 +1,326 @@
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_cors import CORS
-from functools import lru_cache
+import sys
+import threading
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor
 from pathlib import Path
-import h5py
-import pickle
+from dotenv import load_dotenv
+from cachetools import LRUCache
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+
+from cache import RedisCache
+from config import QDRANT_URL, QDRANT_SEARCH_EF
+from utils import (
+    clean_image_path,
+    generate_uuid,
+    hash_id,
+    hash_query,
+    normalize_query,
+)
+
+# Fix windows console unicode errors
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
+# -----------------------------------------------------------------
+# Redis Cache
+# -----------------------------------------------------------------
+cache = RedisCache()
+
 MODEL_ID = "google/siglip2-base-patch16-naflex"
-DATA_DIR = Path("result")
 DATASET_ROOT = Path(__file__).parent / "dataset"
 
-print("Loading embeddings and indices...")
+# -----------------------------------------------------------------
+# Qdrant Database Setup
+# -----------------------------------------------------------------
+print(f"Connecting to Qdrant at {QDRANT_URL}...")
+try:
+    # prefer_grpc=True: gRPC persistent connection avoids the ~2s TCP
+    # handshake penalty that REST suffers from on every request (qdrant_client
+    # does NOT pool HTTP connections in the way `requests.Session` does).
+    # gRPC also brings ~5-9ms per query vs ~2000ms over HTTP on this box.
+    qdrant = QdrantClient(url=QDRANT_URL, prefer_grpc=True, timeout=5.0)
+    collections = [c.name for c in qdrant.get_collections().collections]
+    print(f"[OK] Connected to Qdrant (gRPC). Available collections: {collections}")
 
-# Find latest embedding files (HDF5 format)
-siglip_files = sorted(DATA_DIR.glob("siglip2_embeddings_*.hdf5"), reverse=True)
-siglip_indices = sorted(DATA_DIR.glob("siglip2_faiss_index_*.pkl"), reverse=True)
-dinov3_files = sorted(DATA_DIR.glob("dinov3_embeddings_*.hdf5"), reverse=True)
-dinov3_indices = sorted(DATA_DIR.glob("dinov3_faiss_index_*.pkl"), reverse=True)
-dinov3_dense_files = sorted(DATA_DIR.glob("dinov3_dense_embeddings_*.hdf5"), reverse=True)
-dinov3_dense_indices = sorted(DATA_DIR.glob("dinov3_dense_faiss_index_*.pkl"), reverse=True)
+    if "siglip2" not in collections:
+        print("[WARN] Collection 'siglip2' not found in Qdrant! Please run qdrant_ingest.py first.")
+        sys.exit(1)
 
-if not siglip_files or not siglip_indices:
-    raise FileNotFoundError(f"SigLIP2 embeddings not found in {DATA_DIR}/")
+except Exception as e:
+    print(f"\n[FATAL ERROR] Could not connect to Qdrant Database: {e}")
+    print("Please make sure qdrant.exe is running on Windows (or via Docker) before starting this app.")
+    print("To conserve RAM and ensure stability, the app will now exit.")
+    sys.exit(1)
 
-print(f"Loading SigLIP 2 from {siglip_files[0].name}...")
-with h5py.File(siglip_files[0], 'r') as f:
-    image_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
-    image_paths = [s.decode('utf-8') for s in f['image_paths'][:]]
-with open(siglip_indices[0], 'rb') as f:
-    siglip_index = pickle.load(f)
-print(f"Loaded {len(image_ids)} images for text search")
 
-# Build id→relative-path lookup from SigLIP metadata (shared across all endpoints)
-# image_ids are stored as 'cat/001.jpg' but actual files are under 'animals/cat/001.jpg'
-# Prepend 'animals/' if the path doesn't already start with it
-def _make_rel_path(img_id: str) -> str:
-    if img_id.startswith("animals/"):
-        return img_id
-    return f"animals/{img_id}"
-
-id_to_path = {img_id: _make_rel_path(img_id) for img_id in image_ids}
-
-# Keep file paths for lazy loading (memory optimization for large datasets)
-siglip_embedding_file = siglip_files[0]
-dinov3_embedding_file = None
-dinov3_index = None
-dinov3_ids = []
-dinov3_id_to_idx = {}
-
-if dinov3_files and dinov3_indices:
-    print(f"Loading DINOv3 from {dinov3_files[0].name}...")
-    dinov3_embedding_file = dinov3_files[0]
-    with h5py.File(dinov3_embedding_file, 'r') as f:
-        dinov3_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
-    with open(dinov3_indices[0], 'rb') as f:
-        dinov3_index = pickle.load(f)
-    dinov3_id_to_idx = {img_id: idx for idx, img_id in enumerate(dinov3_ids)}
-    print(f"Loaded {len(dinov3_ids)} images for image search")
-else:
-    print("DINOv3 embeddings not found, image similarity search disabled")
-
-# --- DINOv3 Dense (material / texture similarity) ---
-dinov3_dense_embedding_file = None
-dinov3_dense_index = None
-dinov3_dense_ids = []
-dinov3_dense_id_to_idx = {}
-
-if dinov3_dense_files and dinov3_dense_indices:
-    print(f"Loading DINOv3 Dense from {dinov3_dense_files[0].name}...")
-    dinov3_dense_embedding_file = dinov3_dense_files[0]
-    with h5py.File(dinov3_dense_embedding_file, 'r') as f:
-        dinov3_dense_ids = [s.decode('utf-8') for s in f['image_ids'][:]]
-    with open(dinov3_dense_indices[0], 'rb') as f:
-        dinov3_dense_index = pickle.load(f)
-    dinov3_dense_id_to_idx = {img_id: idx for idx, img_id in enumerate(dinov3_dense_ids)}
-    print(f"Loaded {len(dinov3_dense_ids)} images for material/texture search")
-else:
-    print("DINOv3 Dense embeddings not found, material similarity search disabled")
-
-print("Loading SigLIP 2 model...")
+# -----------------------------------------------------------------
+# Local SigLIP2 Model Setup (For Text Queries)
+# -----------------------------------------------------------------
+print("Loading SigLIP 2 model for text embedding...")
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-model = AutoModel.from_pretrained(MODEL_ID, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+# FP16 is only a real win on CUDA — on CPU the matmuls are usually slower
+# (AVX-512 FP16 is not available on most desktop CPUs). Stay on FP32 by default.
+has_cuda = torch.cuda.is_available()
+_dtype = torch.float16 if has_cuda else torch.float32
+model = AutoModel.from_pretrained(
+    MODEL_ID, torch_dtype=_dtype, low_cpu_mem_usage=True
+)
 model.eval()
-device = "cpu"
-print("SigLIP 2 model loaded and ready!")
+device = "cuda" if has_cuda else "cpu"
+# Cap threads: SigLIP2 forward is small, too many threads hurts cache locality.
+torch.set_num_threads(max(1, min(4, (torch.get_num_threads() or 2))))
+print(f"[OK] SigLIP 2 model loaded ({_dtype}, threads={torch.get_num_threads()}, device={device})!")
 
-@lru_cache(maxsize=1000)
-def embed_text_cached(text: str) -> tuple:
-    """Cache text embeddings to avoid re-computing (LRU cache optimization)"""
-    inputs = processor(text=[text], return_tensors="pt", padding="max_length", max_length=64, truncation=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = model.get_text_features(**inputs)
-        text_features = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs
-        text_features = F.normalize(text_features, p=2, dim=-1)
-    return tuple(text_features.cpu().numpy().flatten().tolist())
+# In-process stampede protection: only one thread runs the model for the same query
+# Bounded LRU so the dict cannot leak memory across millions of unique queries.
+_EMBED_LOCK_MAX = 2048
+_embed_locks: "LRUCache[str, threading.Lock]" = LRUCache(maxsize=_EMBED_LOCK_MAX)
+_embed_locks_guard = threading.Lock()
 
-def embed_text(text: str) -> np.ndarray:
-    """Convert cached tuple back to numpy array"""
-    cached = embed_text_cached(text)
-    return np.array(cached, dtype=np.float32).reshape(1, -1)
+
+def _get_embed_lock(key: str) -> threading.Lock:
+    with _embed_locks_guard:
+        lock = _embed_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _embed_locks[key] = lock
+        return lock
+
+
+def embed_text(text: str) -> list[float]:
+    """Compute (or fetch from cache) the SigLIP2 text embedding."""
+    norm = normalize_query(text)
+    cache_key = hash_query(norm)
+
+    # 1. Try Redis cache first
+    cached_emb = cache.get_embedding(cache_key)
+    if cached_emb is not None:
+        return cached_emb.tolist()[0]
+
+    # 2. Stampede protection: only one thread embeds the same query at a time
+    lock = _get_embed_lock(cache_key)
+    with lock:
+        # Re-check after acquiring the lock (another thread may have just computed it)
+        cached_emb = cache.get_embedding(cache_key)
+        if cached_emb is not None:
+            return cached_emb.tolist()[0]
+
+        # 3. Cache MISS - compute via SigLIP2
+        # IMPORTANT: must use padding='max_length' with a fixed length, NOT
+        # dynamic padding=True. SigLIP2's text encoder is sensitive to sequence
+        # length — a 2-token input for "cat" (padded dynamically) lands in a
+        # different region of embedding space than a 64-token fixed input.
+        # Diagnostic: with dynamic padding, cat-vs-cat sim dropped from 0.11
+        # to -0.03. Fixed 64-token padding matches the Kaggle notebook output.
+        inputs = processor(
+            text=[norm], return_tensors="pt",
+            padding="max_length",
+            max_length=64,
+            truncation=True,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.inference_mode():  # ~5% faster than torch.no_grad()
+            outputs = model.get_text_features(**inputs)
+            text_features = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs
+            text_features = F.normalize(text_features, p=2, dim=-1)
+
+        embedding = text_features.cpu().numpy().astype(np.float32)
+
+    # 4. Store in Redis for next time (outside the lock to keep critical section short)
+    cache.set_embedding(cache_key, embedding)
+    return embedding.tolist()[0]
 
 print("Ready for searches!")
+
+
+def _search_params() -> qmodels.SearchParams:
+    """HNSW ef + scalar-quant rescore. Rescore restores ~99% of full-precision recall
+    while keeping the 4x RAM + bandwidth savings of INT8 quantization."""
+    return qmodels.SearchParams(
+        hnsw_ef=QDRANT_SEARCH_EF,
+        quantization=qmodels.QuantizationSearchParams(
+            ignore=False,
+            rescore=True,
+            oversampling=2.0,
+        ),
+    )
+
+
+def _search_by_image_id(collection: str, image_id: str, top_k: int):
+    """Find points similar to an existing image using Qdrant's `recommend` API.
+
+    1-RTT: Qdrant reads the seed vector internally, then runs cosine KNN
+    against `dinov3` / `dinov3_dense`. Previously we did a separate
+    `retrieve(with_vectors=True)` + `query_points`, which was 2 RTTs.
+    """
+    point_uuid = generate_uuid(image_id)
+    try:
+        resp = qdrant.query_points(
+            collection_name=collection,
+            query=qmodels.RecommendQuery(
+                recommend=qmodels.RecommendInput(positive=[point_uuid])
+            ),
+            limit=top_k + 1,  # +1 to drop the seed from results
+            with_payload=True,
+            with_vectors=False,
+            search_params=_search_params(),
+        )
+    except Exception as e:
+        msg = str(e)
+        if "Not found" in msg or "Point id" in msg:
+            return None, 'not_found'
+        raise
+    hits = [p for p in resp.points if str(p.id) != point_uuid][:top_k]
+    return hits, 'ok'
+
+
+# -----------------------------------------------------------------
+# API Endpoints
+# -----------------------------------------------------------------
 
 @app.route('/')
 def home():
     return render_template('index.html')
+
+
+@app.route('/healthz')
+def healthz():
+    """Liveness + dependency probe. Used by Docker / load balancers.
+
+    Policy: Qdrant is REQUIRED. Redis is optional — if missing, we fall back
+    to the in-memory cache and report `degraded` (200), not 503. This matches
+    the README contract.
+    """
+    qdrant_ok = True
+    try:
+        qdrant.get_collections()
+    except Exception:
+        qdrant_ok = False
+    redis_ok = cache.available
+    healthy = qdrant_ok
+    return jsonify({
+        'status': 'ok' if healthy else 'unavailable',
+        'qdrant': qdrant_ok,
+        'redis': redis_ok,
+        'embedding_dim': 768,
+    }), 200 if healthy else 503
 
 @app.route('/api/search', methods=['POST'])
 def search():
     data = request.json
     query = data.get('query', '')
     top_k = data.get('top_k', 10)
-    
+
     if not query:
         return jsonify({'error': 'Query is required'}), 400
-    
-    query_embedding = embed_text(query)
-    scores, indices = siglip_index.search(query_embedding.astype(np.float32), top_k)
-    
+
+    t_start = time.perf_counter()
+
+    # 1. Check search-result cache (key uses normalized text + top_k)
+    cache_key = f"{normalize_query(query)}|k={top_k}"
+    cached = cache.get_results('text', cache_key, top_k)
+    if cached is not None:
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        return jsonify({'results': cached, 'cache': 'HIT', 'latency_ms': round(elapsed_ms, 2)})
+
+    # 2. Cache MISS - embed query then search Qdrant
+    query_vector = embed_text(query)
+
+    try:
+        search_response = qdrant.query_points(
+            collection_name="siglip2",
+            query=query_vector,
+            limit=top_k,
+            with_payload=True,
+            search_params=_search_params(),
+        )
+        search_result = search_response.points
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
     results = []
-    for rank, (idx, score) in enumerate(zip(indices[0], scores[0])):
-        img_id = image_ids[idx]
-        img_relative = id_to_path.get(img_id, _make_rel_path(img_id))
+    for rank, hit in enumerate(search_result):
+        payload = hit.payload or {}
+        img_id = payload.get('image_id', str(hit.id))
+        img_relative = clean_image_path(payload.get('image_path', img_id))
+
         results.append({
             'rank': rank + 1,
             'image_id': img_id,
             'image_url': f"/images/{img_relative}",
-            'score': float(score)
+            'score': hit.score
         })
-    
-    return jsonify({'results': results})
+
+    # 3. Store results in cache (use normalized key for hit-rate)
+    cache.set_results('text', cache_key, results, top_k)
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    return jsonify({'results': results, 'cache': 'MISS', 'latency_ms': round(elapsed_ms, 2)})
+
 
 @app.route('/api/search-similar', methods=['POST'])
 def search_similar():
-    if dinov3_index is None:
-        return jsonify({'error': 'Image similarity search not available'}), 503
-    
     data = request.json
     image_id = data.get('image_id', '')
     top_k = data.get('top_k', 10)
-    
+
     if not image_id:
         return jsonify({'error': 'image_id is required'}), 400
-    
-    if image_id not in dinov3_id_to_idx:
-        return jsonify({'error': 'Image not found'}), 404
-    
-    idx = dinov3_id_to_idx[image_id]
-    
-    # Lazy load only the needed embedding (memory optimization for large datasets)
-    with h5py.File(dinov3_embedding_file, 'r') as f:
-        query_embedding = f['embeddings'][idx:idx+1]
-    
-    scores, indices = dinov3_index.search(query_embedding.astype(np.float32), top_k + 1)
-    
-    results = []
-    for rank, (idx, score) in enumerate(zip(indices[0], scores[0])):
-        result_id = dinov3_ids[idx]
-        if result_id == image_id:
-            continue
 
-        img_relative = id_to_path.get(result_id, result_id)
+    t_start = time.perf_counter()
+
+    # 1. Check result cache
+    cached = cache.get_results('similar', hash_id(image_id), top_k)
+    if cached is not None:
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        return jsonify({'results': cached, 'cache': 'HIT', 'latency_ms': round(elapsed_ms, 2)})
+
+    # 2. Cache MISS - 1-RTT recommend against the dinov3 collection
+    hits, status = _search_by_image_id("dinov3", image_id, top_k)
+    if status == 'not_found':
+        return jsonify({'error': 'Image not found in dinov3 collection'}), 404
+    if status != 'ok':
+        return jsonify({'error': 'Similarity search failed: ' + status}), 503
+
+    results = []
+    for rank, hit in enumerate(hits):
+        payload = hit.payload or {}
+        res_id = payload.get('image_id', str(hit.id))
+        img_relative = clean_image_path(payload.get('image_path', res_id))
+
         results.append({
-            'rank': len(results) + 1,
-            'image_id': result_id,
+            'rank': rank + 1,
+            'image_id': res_id,
             'image_url': f"/images/{img_relative}",
-            'score': float(score)
+            'score': hit.score
         })
-        if len(results) >= top_k:
-            break
-    
-    return jsonify({'results': results})
+
+    # 3. Store in cache
+    cache.set_results('similar', hash_id(image_id), results, top_k)
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    return jsonify({
+        'results': results,
+        'reference_image_url': f"/images/{clean_image_path(image_id)}",
+        'cache': 'MISS',
+        'latency_ms': round(elapsed_ms, 2),
+    })
+
 
 @app.route('/api/search-similar-material', methods=['POST'])
 def search_similar_material():
     """Material / texture similarity using DINOv3 dense patch-mean features."""
-    if dinov3_dense_index is None:
-        return jsonify({'error': 'Material similarity search not available (DINOv3 Dense embeddings not loaded)'}), 503
-
     data = request.json
     image_id = data.get('image_id', '')
     top_k = data.get('top_k', 10)
@@ -192,43 +328,85 @@ def search_similar_material():
     if not image_id:
         return jsonify({'error': 'image_id is required'}), 400
 
-    if image_id not in dinov3_dense_id_to_idx:
-        return jsonify({'error': 'Image not found in dense index'}), 404
+    t_start = time.perf_counter()
 
-    idx = dinov3_dense_id_to_idx[image_id]
+    # 1. Check result cache
+    cached = cache.get_results('material', hash_id(image_id), top_k)
+    if cached is not None:
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        return jsonify({'results': cached, 'cache': 'HIT', 'latency_ms': round(elapsed_ms, 2)})
 
-    # Lazy-load only the single query embedding (memory efficient)
-    with h5py.File(dinov3_dense_embedding_file, 'r') as f:
-        query_embedding = f['embeddings'][idx:idx+1]
-
-    scores, indices = dinov3_dense_index.search(query_embedding.astype(np.float32), top_k + 1)
+    # 2. Cache MISS - 1-RTT recommend against the dinov3_dense collection
+    hits, status = _search_by_image_id("dinov3_dense", image_id, top_k)
+    if status == 'not_found':
+        return jsonify({'error': 'Image not found in dinov3_dense collection'}), 404
+    if status != 'ok':
+        return jsonify({'error': 'Material search failed: ' + status}), 503
 
     results = []
-    for rank, (res_idx, score) in enumerate(zip(indices[0], scores[0])):
-        result_id = dinov3_dense_ids[res_idx]
-        if result_id == image_id:
-            continue
+    for rank, hit in enumerate(hits):
+        payload = hit.payload or {}
+        res_id = payload.get('image_id', str(hit.id))
+        img_relative = clean_image_path(payload.get('image_path', res_id))
 
-        img_relative = id_to_path.get(result_id, result_id)
         results.append({
-            'rank': len(results) + 1,
-            'image_id': result_id,
+            'rank': rank + 1,
+            'image_id': res_id,
             'image_url': f"/images/{img_relative}",
-            'score': float(score)
+            'score': hit.score
         })
-        if len(results) >= top_k:
-            break
 
-    return jsonify({'results': results})
+    # 3. Store in cache
+    cache.set_results('material', hash_id(image_id), results, top_k)
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    return jsonify({
+        'results': results,
+        'reference_image_url': f"/images/{clean_image_path(image_id)}",
+        'cache': 'MISS',
+        'latency_ms': round(elapsed_ms, 2),
+    })
+
+
+# -----------------------------------------------------------------
+# Cache Management Endpoints
+# -----------------------------------------------------------------
+
+@app.route('/api/cache/stats', methods=['GET'])
+def cache_stats():
+    """Return Redis cache statistics (hits, misses, memory, key counts)."""
+    return jsonify(cache.stats())
+
+@app.route('/api/cache/clear', methods=['POST'])
+def cache_clear():
+    """Clear all cached search results and embeddings."""
+    count = cache.clear_all()
+    return jsonify({'status': 'ok', 'deleted_keys': count})
 
 
 @app.route('/images/<path:filepath>')
 def serve_image(filepath):
-    # filepath is relative to DATASET_ROOT (e.g., 'animals/cat/001.jpg')
+    # filepath is relative to DATASET_ROOT (e.g., 'animals/cat/001.jpg').
+    # Some Qdrant records were generated when the dataset was mounted flat
+    # (e.g. 'cat/001.jpg' with no 'animals/' segment), so we fall back to
+    # prepending 'animals/' if the direct path is missing.
     full_path = DATASET_ROOT / filepath
     if not full_path.exists():
-        return jsonify({'error': 'Image not found'}), 404
-    return send_from_directory(full_path.parent, full_path.name)
+        alt = DATASET_ROOT / "animals" / filepath
+        if alt.exists():
+            full_path = alt
+    if not full_path.exists():
+        return jsonify({'error': 'Image not found', 'tried': [str(full_path)]}), 404
+    response = send_from_directory(full_path.parent, full_path.name)
+    # Images are content-addressed via image_id (UUID) — safe to cache for 1 day
+    response.headers['Cache-Control'] = 'public, max-age=86400, immutable'
+    return response
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    import os
+    port = int(os.environ.get("APP_PORT", "5000"))
+    # Production WSGI server: multi-threaded, no debug reloader, Windows-friendly.
+    # Waitress has no external deps and supports threads (Flask dev server doesn't).
+    from waitress import serve
+    print(f"\n[BOOT] Waitress serving on 0.0.0.0:{port} (threads=4)")
+    serve(app, host='0.0.0.0', port=port, threads=4, ident='mmis')

@@ -12,6 +12,19 @@ Hệ thống tìm kiếm ảnh đa phương thức sử dụng **SigLIP2** (tìm
 
 ---
 
+## Screenshots
+
+**Trang chủ** — giao diện search với input text + kết quả grid:
+![Homepage](screenshots/homepage.png)
+
+**Text Search** — gõ "sleeping cat" → SigLIP2 tìm ảnh khớp nhất:
+![Text search results](screenshots/text_search_results.png)
+
+**Similar Image Search** — click "Find Similar" trên 1 ảnh → DINOv3 tìm ảnh trông giống:
+![Similar search with reference](screenshots/similar_search_with_reference.png)
+
+---
+
 ## Cấu trúc project
 
 ```
@@ -25,11 +38,8 @@ Hệ thống tìm kiếm ảnh đa phương thức sử dụng **SigLIP2** (tìm
 │
 ├── result/                          # Output của pipeline (gitignored)
 │   ├── siglip2_embeddings_*.hdf5
-│   ├── siglip2_faiss_index_*.pkl
 │   ├── dinov3_embeddings_*.hdf5
-│   ├── dinov3_faiss_index_*.pkl
-│   ├── dinov3_dense_embeddings_*.hdf5
-│   └── dinov3_dense_faiss_index_*.pkl
+│   └── dinov3_dense_embeddings_*.hdf5
 │
 ├── secrets/                         # HF Token lưu riêng (gitignored)
 │   ├── HF_TOKEN.txt
@@ -41,11 +51,14 @@ Hệ thống tìm kiếm ảnh đa phương thức sử dụng **SigLIP2** (tìm
 ├── templates/index.html
 │
 ├── app.py                  # Flask web app — chạy để dùng UI tìm kiếm
+├── cache.py                # Redis cache + in-memory fallback
 ├── config.py               # Cấu hình model, đường dẫn (dùng chung bởi pipeline)
+├── qdrant_ingest.py        # Nạp embeddings vào Qdrant (idempotent, có HNSW + ScalarQuant)
 ├── kaggle_pipeline.py      # Pipeline chính: push → monitor → download
 ├── kaggle_download.py      # Tải output từ kernel đã chạy xong
 ├── kaggle_dataset.py       # Upload dataset ảnh lên Kaggle
 ├── run.py                  # Orchestrator: gộp tất cả bước vào 1 lệnh
+├── utils.py                # Shared helpers (UUID, path cleanup, cache hashing)
 ├── .env.example            # Template secret cho dev local
 └── pyproject.toml
 ```
@@ -64,6 +77,55 @@ Hệ thống tìm kiếm ảnh đa phương thức sử dụng **SigLIP2** (tìm
 # Cài dependencies
 uv sync
 ```
+
+---
+
+## Quick Start (chạy từ đầu đến cuối)
+
+Đây là flow ngắn nhất. Chi tiết từng bước xem ở các section dưới.
+
+**Lần đầu tiên:**
+```bash
+# 1. Cài deps + setup env
+uv sync
+cp .env.example .env          # rồi điền HF_TOKEN, KAGGLE_USERNAME, KAGGLE_KEY
+
+# 2. Khởi động Qdrant (mở terminal riêng, để chạy nền)
+cd F:\qdrant && .\qdrant.exe
+
+# 3. Khởi động Redis (WSL, optional — app vẫn chạy nếu Redis down)
+wsl -d Ubuntu-24.04 -- sudo service redis-server start
+
+# 4. Upload dataset lên Kaggle (1 lần duy nhất)
+uv run python kaggle_dataset.py --folder dataset
+
+# 5. Tạo embedding cho 3 model (mỗi model ~5-10 phút trên Kaggle T4)
+uv run python kaggle_pipeline.py --type siglip2    --dataset-slug <username>/<dataset> --auto-download
+uv run python kaggle_pipeline.py --type dinov3     --dataset-slug <username>/<dataset> --auto-download
+uv run python kaggle_pipeline.py --type dinov3_dense --dataset-slug <username>/<dataset> --auto-download
+
+# 6. Nạp embeddings vào Qdrant (idempotent — chạy lại OK)
+uv run python qdrant_ingest.py
+
+# 7. Khởi động web server (Waitress, mặc định port 5000)
+uv run python app.py
+# → Mở http://localhost:5000
+```
+
+**Các lần sau (dataset/model không đổi):**
+```bash
+# 1. Start Qdrant + Redis (nếu chưa chạy)
+# 2. Chỉ cần start server
+uv run python app.py
+```
+
+**Khi muốn thay đổi gì đó:**
+| Tình huống | Cần chạy lại |
+|---|---|
+| Thêm/xoá ảnh trong `dataset/` | Bước 4 (re-upload) + Bước 5 (re-embed) + Bước 6 (re-ingest) |
+| Đổi model SigLIP2/DINOv3 | Bước 5 của model đó + Bước 6 với `--force` |
+| Đổi cấu hình HNSW/Quantization | Bước 6 với `--force` (wipe + re-ingest) |
+| Cache cũ/mới sau re-ingest | Bước 6 với `--clear-redis` |
 
 ---
 
@@ -165,19 +227,101 @@ uv run python run.py --server-only
 
 ---
 
-### Chạy web app tìm kiếm
+### Khởi động Qdrant Vector Database (Windows)
+
+Hệ thống sử dụng **Qdrant** làm Vector Database chính để tìm kiếm hàng triệu ảnh siêu nhanh (chỉ tốn ~1.2GB RAM nhờ Scalar Quantization). Cấu hình mặc định trong `qdrant_ingest.py`:
+
+- **HNSW**: `m=16`, `ef_construct=200`, `full_scan_threshold=1000` (build chỉ mục ngay từ 1000 vector trở lên, không phải 10k như mặc định)
+- **Quantization**: Scalar INT8, `always_ram=True` (~4× giảm RAM)
+- **Payload index** trên `image_id` để lookup O(log n)
+- **gRPC** (`prefer_grpc=True`) — kết nối persistent, **15x nhanh hơn** HTTP (search latency: 2200ms → 140-170ms)
+
+**Bước 1: Tải và giải nén (Làm 1 lần)**
+1. Tải file `qdrant-x86_64-pc-windows-msvc.zip` từ [Qdrant GitHub Releases](https://github.com/qdrant/qdrant/releases/latest).
+2. Giải nén vào ổ F (hoặc ổ nào còn trống nhiều), ví dụ: `F:\qdrant`.
+
+**Bước 2: Chạy Qdrant (Mỗi lần bật máy)**
+```powershell
+# Mở PowerShell, cd vào thư mục đã giải nén
+cd F:\qdrant
+.\qdrant.exe
+```
+> **Lưu ý:** Qdrant sẽ tự tạo thư mục `F:\qdrant\storage` để lưu dữ liệu. Bạn có thể xem giao diện quản lý DB tại http://localhost:6333/dashboard
+
+**Bước 3: Nạp embeddings vào Qdrant (idempotent — chạy lại nhiều lần OK)**
+```bash
+# Lần đầu hoặc khi có embeddings mới
+uv run python qdrant_ingest.py
+
+# Bắt buộc wipe + ingest lại từ đầu (vd khi đổi model)
+uv run python qdrant_ingest.py --force
+
+# Đồng thời xoá Redis cache (an toàn sau khi re-ingest)
+uv run python qdrant_ingest.py --force --clear-redis
+```
+> Mặc định `qdrant_ingest.py` sẽ **skip** nếu collection đã đủ số vector, dùng `--force` khi muốn xoá hết và ingest lại.
+
+---
+
+### Khởi động Redis Cache (WSL)
+
+Redis chạy trong WSL để tăng tốc search. Cần khởi động **mỗi lần bật máy**:
 
 ```bash
+# Lần đầu — cài Redis (chỉ làm 1 lần)
+wsl -d Ubuntu-24.04
+sudo apt-get update && sudo apt-get install -y redis-server
+sudo sed -i 's/^bind 127.0.0.1 -::1/bind 0.0.0.0/' /etc/redis/redis.conf
+
+# Mỗi lần khởi động máy — start Redis
+wsl -d Ubuntu-24.04 -- sudo service redis-server start
+
+# Kiểm tra đang chạy (phải ra PONG)
+wsl -d Ubuntu-24.04 -- redis-cli ping
+```
+
+> **Lưu ý:** Nếu không có Redis, hệ thống tự động fallback sang in-memory cache — app vẫn chạy bình thường nhưng không chia sẻ cache giữa các process.
+
+---
+
+### Chạy web app tìm kiếm
+
+App chạy bằng **Waitress** (production WSGI server, 4 threads) thay vì Flask dev server — ổn định hơn và handle được concurrent requests tốt hơn.
+
+```bash
+# Bước 1: Đảm bảo Qdrant đang chạy (cửa sổ qdrant.exe đang mở)
+# Bước 2: Đảm bảo Redis đang chạy (nếu dùng WSL)
+wsl -d Ubuntu-24.04 -- redis-cli ping
+
+# Bước 3: Khởi động server (Waitress ở http://localhost:5000)
 uv run python app.py
 # Mở trình duyệt: http://localhost:5000
+
+# Hoặc chạy trực tiếp bằng waitress (tương đương, hữu ích cho systemd/supervisor):
+uv run waitress-serve --listen=*:5000 --threads=4 'app:create_app()'
 ```
 
 **Cách dùng UI:**
 | Thao tác | Kết quả |
 |---|---|
-| Gõ mô tả (VD: `sleeping cat`) → Search | Tìm ảnh theo text |
-| Click **Find Similar** trên một ảnh | Tìm ảnh trông giống |
-| Click **Find Material** trên một ảnh | Tìm ảnh cùng chất liệu/màu sắc |
+| Gõ mô tả (VD: `sleeping cat`) → Search | Tìm ảnh theo text (SigLIP2) |
+| Click **Find Similar** trên một ảnh | Tìm ảnh trông giống (DINOv3) |
+| Click **Find Material** trên một ảnh | Tìm ảnh cùng chất liệu/màu sắc (DINOv3 Dense) |
+
+**Cache API:**
+| Endpoint | Mô tả |
+|---|---|
+| `GET /healthz` | Health probe — trả 200 OK nếu Qdrant lên. Redis optional (200 degraded nếu Redis down) |
+| `GET /api/cache/stats` | Xem thống kê cache (hits, misses, memory) |
+| `POST /api/cache/clear` | Xóa toàn bộ cache |
+
+**Đổi port:**
+```bash
+# Mặc định 5000. Đặt biến môi trường APP_PORT trước khi chạy:
+APP_PORT=8080 uv run python app.py
+# hoặc dùng orchestrator
+uv run python run.py --server-only --port 8080
+```
 
 ---
 
@@ -202,7 +346,10 @@ uv run python kaggle_pipeline.py --type dinov3 \
 uv run python kaggle_pipeline.py --type dinov3_dense \
   --dataset-slug <username>/dataset --auto-download
 
-# Bước 6: Khởi động web app
+# Bước 6: Khởi động Redis cache (WSL)
+wsl -d Ubuntu-24.04 -- sudo service redis-server start
+
+# Bước 7: Khởi động web app
 uv run python app.py
 ```
 
@@ -241,13 +388,12 @@ Files được lưu vào `result/` với timestamp tránh trùng tên:
 
 ```
 result/
-├── siglip2_embeddings_20260612_164950.hdf5     (~16 MB)
-├── siglip2_faiss_index_20260612_164950.pkl     (~16 MB)
-├── dinov3_embeddings_20260612_170536.hdf5      (~16 MB)
-├── dinov3_faiss_index_20260612_170536.pkl      (~16 MB)
-├── dinov3_dense_embeddings_20260612_170849.hdf5 (~16 MB)
-└── dinov3_dense_faiss_index_20260612_170849.pkl (~16 MB)
+├── siglip2_embeddings_20260617_170000.hdf5     (~16 MB cho 5400 ảnh)
+├── dinov3_embeddings_20260617_171200.hdf5      (~16 MB)
+└── dinov3_dense_embeddings_20260617_172400.hdf5 (~16 MB)
 ```
+
+> Hệ thống không còn sinh file `.pkl` (FAISS đã được thay bằng Qdrant ở phiên bản 1.1). Mọi search chạy trực tiếp trên Qdrant collections (`siglip2`, `dinov3`, `dinov3_dense`).
 
 **Đọc HDF5:**
 ```python

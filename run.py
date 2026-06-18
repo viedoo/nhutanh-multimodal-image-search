@@ -14,10 +14,11 @@ Usage:
     # Run server with existing embeddings
     python run.py --server-only
 """
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import argparse
 import subprocess
-import sys
-from pathlib import Path
 
 
 def run_command(cmd, description):
@@ -29,7 +30,7 @@ def run_command(cmd, description):
     
     result = subprocess.run(cmd, shell=False)
     if result.returncode != 0:
-        print(f"\n✗ Failed: {description}")
+        print(f"\n[FAIL] Failed: {description}")
         return False
     return True
 
@@ -68,15 +69,26 @@ def main():
     # Validate arguments
     if args.server_only:
         # Just start server
-        cmd = ["python", "app.py"]
+        cmd = [sys.executable, "app.py"]
+        if args.port and args.port != 5000:
+            # app.py currently reads port from a constant; forward via env var
+            # so that the same script stays the single source of truth.
+            import os
+            env = os.environ.copy()
+            env["APP_PORT"] = str(args.port)
+            print(f"\n{'='*60}")
+            print(f"Starting Flask Server on port {args.port}")
+            print(f"{'='*60}\n")
+            result = subprocess.run(cmd, shell=False, env=env)
+            sys.exit(result.returncode)
         sys.exit(0 if run_command(cmd, "Starting Flask Server") else 1)
     
     if args.upload_only:
         if not args.upload_dataset:
-            print("✗ --upload-dataset required with --upload-only")
+            print("[FAIL] --upload-dataset required with --upload-only")
             sys.exit(1)
         
-        cmd = ["python", "kaggle_dataset.py", "--folder", args.upload_dataset]
+        cmd = [sys.executable, "kaggle_dataset.py", "--folder", args.upload_dataset]
         if args.dataset_slug:
             cmd.extend(["--slug", args.dataset_slug])
         if args.dataset_public:
@@ -85,15 +97,15 @@ def main():
         sys.exit(0 if run_command(cmd, "Uploading Dataset") else 1)
     
     if not args.type:
-        print("✗ --type required (unless using --upload-only or --server-only)")
+        print("[FAIL] --type required (unless using --upload-only or --server-only)")
         sys.exit(1)
     
     if not args.upload_dataset and not args.dataset_slug:
-        print("✗ Either --upload-dataset or --dataset-slug required")
+        print("[FAIL] Either --upload-dataset or --dataset-slug required")
         sys.exit(1)
     
     # Step 1: Build pipeline command
-    cmd = ["python", "kaggle_pipeline.py", "--type", args.type]
+    cmd = [sys.executable, "kaggle_pipeline.py", "--type", args.type]
     
     if args.upload_dataset:
         cmd.extend(["--upload-dataset", args.upload_dataset])
@@ -110,8 +122,14 @@ def main():
     # Step 2: Run pipeline
     if not run_command(cmd, "Running Kaggle Pipeline"):
         sys.exit(1)
+        
+    # Step 3: Run Qdrant Ingestion (if we downloaded new embeddings)
+    if not args.skip_download:
+        ingest_cmd = [sys.executable, "qdrant_ingest.py"]
+        if not run_command(ingest_cmd, "Ingesting embeddings into Qdrant Local"):
+            print("[WARN] Qdrant ingestion failed or Qdrant is not running. Server may fail to start.")
     
-    # Step 3: Start server if requested
+    # Step 4: Start server if requested
     if not args.skip_server:
         print(f"\n{'='*60}")
         print("Pipeline complete! Starting Flask server...")
@@ -119,11 +137,11 @@ def main():
         print("Server will be available at: http://localhost:5000")
         print("Press Ctrl+C to stop\n")
         
-        server_cmd = ["python", "app.py"]
+        server_cmd = [sys.executable, "app.py"]
         subprocess.run(server_cmd)
     else:
         print(f"\n{'='*60}")
-        print("✓ Pipeline complete!")
+        print("[OK] Pipeline complete!")
         print(f"{'='*60}\n")
         print("To start server:")
         print("  python app.py")

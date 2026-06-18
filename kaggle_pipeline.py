@@ -6,6 +6,9 @@ Usage:
     python kaggle_pipeline.py --type siglip2 --upload-dataset dataset --auto-download
     python kaggle_pipeline.py --type dinov3 --upload-dataset dataset --auto-download
 """
+import sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 import time
 import argparse
 import json
@@ -13,7 +16,13 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from kaggle.api.kaggle_api_extended import KaggleApi
-from config import get_model_config, get_dataset_slug, RESULT_DIR, DEFAULT_MONITOR_INTERVAL, DEFAULT_MAX_WAIT
+from config import (
+    DEFAULT_MAX_WAIT,
+    DEFAULT_MONITOR_INTERVAL,
+    KAGGLE_HF_SECRETS_SLUG,
+    RESULT_DIR,
+    get_model_config,
+)
 
 
 def push_notebook(api, notebook_type, dataset_slug, username):
@@ -40,7 +49,7 @@ def push_notebook(api, notebook_type, dataset_slug, username):
         
         # Add HF secrets dataset for models that need it
         if model_config['requires_hf_token']:
-            secrets_dataset = f"{username}/my-hf-secrets"
+            secrets_dataset = f"{username}/{KAGGLE_HF_SECRETS_SLUG}"
             dataset_sources.append(secrets_dataset)
             print(f"  Added secrets dataset: {secrets_dataset}")
         
@@ -69,7 +78,7 @@ def push_notebook(api, notebook_type, dataset_slug, username):
         version_number = response.version_number
         kernel_ref = response.ref
         
-        print(f"  ✓ Kernel pushed successfully!")
+        print(f"  [OK] Kernel pushed successfully!")
         print(f"    Ref: {kernel_ref}")
         print(f"    Version: {version_number}")
         print(f"    URL: https://www.kaggle.com/code/{kernel_slug}")
@@ -94,6 +103,51 @@ def push_notebook(api, notebook_type, dataset_slug, username):
             shutil.rmtree(kernel_dir, ignore_errors=True)
 
 
+def fetch_kernel_log(api, kernel_slug, notebook_type, last_n_lines=60):
+    """Download and display the tail of a kernel log so the user can see actual errors.
+
+    Returns True if a log was found and printed, False otherwise.
+
+    The kaggle==2.2.0 API has no `kernels_log` method, so we reuse
+    `kernels_output` — it bundles the .log file alongside the output artifacts.
+    """
+    temp_dir = Path(f"./temp_log_{notebook_type}")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[LOG] Fetching kernel log: {kernel_slug}")
+    try:
+        try:
+            # Force a fresh download even if Kaggle has cached the version.
+            api.kernels_output(kernel_slug, path=str(temp_dir), force=True, quiet=True)
+        except UnicodeEncodeError:
+            # Kaggle CLI tried to print non-ASCII to a cp1252 console; that's fine —
+            # the log file itself has already been written to disk.
+            print("  (Console encoding issue while downloading — log file may still be available.)")
+        except Exception as e:
+            print(f"  Could not fetch log: {e}")
+            return False
+
+        candidates = list(temp_dir.glob("*.log"))
+        if not candidates:
+            print(f"  No .log file in {temp_dir} (files: {[p.name for p in temp_dir.iterdir()]})")
+            return False
+
+        # Read with utf-8 + 'replace' so any odd byte never crashes the script.
+        log_path = candidates[0]
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        print(f"  Log file: {log_path.name} ({len(lines)} lines, showing last {min(last_n_lines, len(lines))})")
+        print("  " + "-" * 56)
+        tail = lines[-last_n_lines:] if len(lines) > last_n_lines else lines
+        for line in tail:
+            print("  " + line.rstrip())
+        print("  " + "-" * 56)
+        return True
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def monitor_kernel(api, tracking_data, interval=30, max_wait=1200):
     """Monitor kernel execution with proper status tracking"""
     kernel_slug = tracking_data['kernel_slug']
@@ -115,7 +169,7 @@ def monitor_kernel(api, tracking_data, interval=30, max_wait=1200):
         elapsed = time.time() - start_time
         
         if elapsed > max_wait:
-            print(f"\n⚠ Timeout after {max_wait}s ({max_wait/60:.0f} minutes)")
+            print(f"\n[TIMEOUT] after {max_wait}s ({max_wait/60:.0f} minutes)")
             print(f"  Kernel may still be running. Check manually:")
             print(f"  https://www.kaggle.com/code/{kernel_slug}")
             print(f"\n  To download later:")
@@ -135,17 +189,19 @@ def monitor_kernel(api, tracking_data, interval=30, max_wait=1200):
             
             # Check completion
             if current_status == 'complete':
-                print(f"\n✓ Kernel completed!")
+                print(f"\n[DONE] Kernel completed!")
                 print(f"  Total time: {elapsed:.0f}s ({elapsed/60:.1f} minutes)")
                 return True
             
             # Check failures
             if current_status in ['error', 'cancelacknowledged', 'cancelled', 'failed']:
                 failure_msg = getattr(status_response, 'failure_message', None)
-                print(f"\n✗ Kernel failed: {current_status}")
+                print(f"\n[ERROR] Kernel failed: {current_status}")
                 if failure_msg:
                     print(f"  Message: {failure_msg}")
                 print(f"  Check logs: https://www.kaggle.com/code/{kernel_slug}")
+                # Try to grab the actual log so the user can see the real stacktrace.
+                fetch_kernel_log(api, kernel_slug, notebook_type)
                 return False
             
             # Print status updates
@@ -168,7 +224,7 @@ def monitor_kernel(api, tracking_data, interval=30, max_wait=1200):
                 print(f"[{int(elapsed)}s] API error: {error_msg}")
             
             if consecutive_errors >= 5:
-                print(f"\n✗ Too many errors ({consecutive_errors}). Check manually.")
+                print(f"\n[FAIL] Too many errors ({consecutive_errors}). Check manually.")
                 return False
         
         time.sleep(interval)
@@ -210,14 +266,21 @@ def download_outputs(api, tracking_data):
                 dest = RESULT_DIR / new_name
                 shutil.move(str(f), str(dest))
                 size_mb = dest.stat().st_size / 1024**2
-                print(f"  ✓ {new_name} ({size_mb:.2f} MB)")
+                print(f"  [OK] {new_name} ({size_mb:.2f} MB)")
                 moved += 1
         
         if moved == 0:
             print(f"  No output files found")
+            # If the kernel "completed" but produced no output, the notebook
+            # almost certainly errored out (e.g. missing HDF5 save cell, OOM).
+            # Fetch the log to show the actual root cause.
+            try:
+                fetch_kernel_log(api, kernel_slug, notebook_type)
+            except Exception as e:
+                print(f"  (Could not fetch log: {e})")
             return False
         
-        print(f"  ✓ Downloaded {moved} files")
+        print(f"  [OK] Downloaded {moved} files")
         return True
         
     except Exception as e:
@@ -269,13 +332,13 @@ def main():
                 slug=args.dataset_slug,
                 public=args.dataset_public
             )
-            print(f"\n✓ Dataset uploaded: {dataset_slug}\n")
+            print(f"\n[OK] Dataset uploaded: {dataset_slug}\n")
         except Exception as e:
-            print(f"\n✗ Dataset upload failed: {e}")
+            print(f"\n[FAIL] Dataset upload failed: {e}")
             return 1
     
     if not dataset_slug:
-        print("✗ No dataset specified. Use --upload-dataset or --dataset-slug")
+        print("[FAIL] No dataset specified. Use --upload-dataset or --dataset-slug")
         return 1
     
     # Step 1: Push notebook
@@ -285,11 +348,11 @@ def main():
     try:
         tracking_data = push_notebook(api, args.type, dataset_slug, username)
     except Exception as e:
-        print(f"\n✗ Push failed: {e}")
+        print(f"\n[FAIL] Push failed: {e}")
         return 1
     
     if args.push_only:
-        print(f"\n✓ Push complete")
+        print(f"\n[OK] Push complete")
         return 0
     
     # Step 2: Monitor
@@ -301,7 +364,7 @@ def main():
     success = monitor_kernel(api, tracking_data, args.interval, args.max_wait)
     
     if not success:
-        print(f"\n✗ Pipeline incomplete")
+        print(f"\n[FAIL] Pipeline incomplete")
         return 1
     
     # Step 3: Download
@@ -311,13 +374,13 @@ def main():
         print("=" * 60)
         download_success = download_outputs(api, tracking_data)
         if download_success:
-            print(f"\n✓ Pipeline completed!")
+            print(f"\n[OK] Pipeline completed!")
             return 0
         else:
-            print(f"\n⚠ Download failed")
+            print(f"\n[WARN] Download failed")
             return 1
     else:
-        print(f"\n✓ Kernel complete. Download with:")
+        print(f"\n[OK] Kernel complete. Download with:")
         print(f"  python kaggle_download.py --type {args.type}")
         return 0
 

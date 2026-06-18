@@ -12,6 +12,27 @@ DATASET_DIR = PROJECT_ROOT / "dataset"
 
 # Kaggle settings
 KAGGLE_DATASET_MOUNT_NAME = "my-dataset"  # This will be the folder name in /kaggle/input/
+KAGGLE_HF_SECRETS_SLUG = "my-hf-secrets"  # Private dataset that holds HF_TOKEN.txt
+
+# Qdrant settings
+QDRANT_URL = "http://localhost:6333"
+# HNSW + quantization tuning (target = max speed, build HNSW early so even
+# the 5400-image dev dataset uses ANN instead of brute-force)
+QDRANT_HNSW_M = 16
+QDRANT_HNSW_EF_CONSTRUCT = 200
+QDRANT_FULL_SCAN_THRESHOLD = 1000
+QDRANT_INDEXING_THRESHOLD = 1000
+QDRANT_SEARCH_EF = 128                # search-time ef for KNN
+QDRANT_QUANTILE = 0.99                # scalar quant outlier clamp
+QDRANT_BATCH_SIZE = 2048              # points per upload_points() call
+QDRANT_UPLOAD_PARALLEL = 4            # concurrent in-flight batches
+QDRANT_OPTIMIZER_POLL_INTERVAL = 2.0  # seconds
+QDRANT_OPTIMIZER_TIMEOUT = 300        # seconds
+# Datasets that should NEVER be auto-detected as the image dataset
+NOTEBOOK_DATASET_BLACKLIST = (
+    KAGGLE_HF_SECRETS_SLUG,
+    "kaggle-data-overlay",
+)
 
 # Model configurations
 MODELS = {
@@ -39,14 +60,13 @@ MODELS = {
 }
 
 # Pipeline defaults
-DEFAULT_MONITOR_INTERVAL = 30  # seconds
+DEFAULT_MONITOR_INTERVAL = 10  # seconds (was 30s; reduced to minimize poll-overhead lag)
 DEFAULT_MAX_WAIT = 1200  # seconds (20 minutes)
 DEFAULT_BATCH_CHECK_DELAY = 5  # seconds before starting monitoring
 
 # Output file patterns
 OUTPUT_PATTERNS = {
     "embeddings": "{model_type}_embeddings_{timestamp}.hdf5",
-    "faiss_index": "{model_type}_faiss_index_{timestamp}.pkl",
 }
 
 # Dataset validation

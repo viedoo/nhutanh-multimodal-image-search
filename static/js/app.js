@@ -79,7 +79,7 @@ async function findSimilar(e) {
 
         const data = await response.json();
         searchInput.value = `Similar to: ${imageId}`;
-        displayResults(data.results, imageId, 'similar');
+        displayResults(data.results, imageId, 'similar', data.reference_image_url);
     } catch (err) {
         showError('Similar search failed: ' + err.message);
     } finally {
@@ -108,9 +108,7 @@ async function findMaterial(e) {
 
         const data = await response.json();
         searchInput.value = `Material: ${imageId}`;
-
-        // Truyền referenceImageId và badge loại 'material'
-        displayResults(data.results, imageId, 'material');
+        displayResults(data.results, imageId, 'material', data.reference_image_url);
     } catch (err) {
         showError('Material search failed: ' + err.message);
     } finally {
@@ -118,7 +116,7 @@ async function findMaterial(e) {
     }
 }
 
-function displayResults(items, referenceImageId = null, searchType = 'similar') {
+function displayResults(items, referenceImageId = null, searchType = 'similar', referenceImageUrl = null) {
     results.innerHTML = '';
 
     if (items.length === 0) {
@@ -126,13 +124,15 @@ function displayResults(items, referenceImageId = null, searchType = 'similar') 
         return;
     }
 
-    // 1. Nếu có referenceImageId, render card này TRƯỚC TIÊN
+    // 1. Nếu có referenceImageId, render card tham chiếu TRƯỚC TIÊN.
+    //    Backend trả về URL đã chuẩn hoá qua reference_image_url — không hardcode ở frontend.
     if (referenceImageId) {
+        const refImgUrl = referenceImageUrl || `/images/animals/${referenceImageId}`;
         const refCard = document.createElement('div');
-        refCard.className = 'result-card reference-card'; // Tái sử dụng form của result-card
+        refCard.className = 'result-card reference-card';
         refCard.innerHTML = `
             <div class="reference-header">Reference Image</div>
-            <img src="/images/animals/${referenceImageId}" alt="${referenceImageId}">
+            <img src="${refImgUrl}" alt="${referenceImageId}">
             <div class="result-info">
                 <div class="image-id" style="color: #333; font-weight: bold; font-size: 0.95rem;">ID: ${referenceImageId}</div>
             </div>
