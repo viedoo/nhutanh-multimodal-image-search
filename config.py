@@ -81,6 +81,10 @@ OUTPUT_PATTERNS = {
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"}
 
+# Video search settings (text-to-video via Qwen3-VL-Embedding)
+VIDEO_COLLECTION = "qwen3vl"
+VIDEO_EMBED_INSTRUCTION = "Represent the user's input for video retrieval."
+
 def get_model_config(model_type: str) -> dict:
     """Get configuration for a specific model type"""
     if model_type not in MODELS:

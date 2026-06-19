@@ -14,7 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from cache import RedisCache
-from config import QDRANT_URL, QDRANT_SEARCH_EF
+from config import QDRANT_URL, QDRANT_SEARCH_EF, VIDEO_COLLECTION, VIDEO_EMBED_INSTRUCTION
 from utils import (
     clean_image_path,
     generate_uuid,
@@ -382,6 +382,168 @@ def cache_clear():
     """Clear all cached search results and embeddings."""
     count = cache.clear_all()
     return jsonify({'status': 'ok', 'deleted_keys': count})
+
+
+# -----------------------------------------------------------------
+# Video Search (Qwen3-VL-Embedding) — lazy-loaded
+# -----------------------------------------------------------------
+
+_qwen3vl_model = None
+_qwen3vl_lock = threading.Lock()
+QWEN3VL_MODEL_ID = "Qwen/Qwen3-VL-Embedding-2B"
+
+
+def _get_qwen3vl_model():
+    """Lazy-load the Qwen3-VL-Embedding model on first video search.
+
+    The model is ~4 GB in BF16 — adding it to startup would slow boot and
+    double RAM usage. Only loaded when /api/search-video is actually called.
+    """
+    global _qwen3vl_model
+    if _qwen3vl_model is not None:
+        return _qwen3vl_model
+    with _qwen3vl_lock:
+        if _qwen3vl_model is not None:
+            return _qwen3vl_model
+        from scripts.qwen3_vl_embedding import Qwen3VLEmbedder  # noqa: PLC0415
+        _dtype = torch.bfloat16 if has_cuda else torch.float32
+        print(f"[LAZY] Loading {QWEN3VL_MODEL_ID} for video search...")
+        t0 = time.time()
+        _qwen3vl_model = Qwen3VLEmbedder(
+            model_name_or_path=QWEN3VL_MODEL_ID,
+            max_length=8192,
+            max_pixels=224 * 224,    # match notebook's tuned setting
+            fps=0.5,
+            max_frames=16,
+            torch_dtype=_dtype,
+        )
+        print(f"[LAZY] Qwen3-VL-Embedding ready in {time.time() - t0:.1f}s")
+        return _qwen3vl_model
+
+
+def embed_text_for_video(text: str) -> list[float]:
+    """Embed a text query into Qwen3-VL-Embedding space (1024d, L2-normalized)."""
+    norm = normalize_query(text)
+    cache_key = hash_query(norm)
+
+    # 1. Try Redis cache first
+    cached_emb = cache.get_embedding(f"video|{cache_key}")
+    if cached_emb is not None:
+        return cached_emb.tolist()[0]
+
+    lock = _get_embed_lock(f"video|{cache_key}")
+    with lock:
+        cached_emb = cache.get_embedding(f"video|{cache_key}")
+        if cached_emb is not None:
+            return cached_emb.tolist()[0]
+
+        # 2. Compute via Qwen3VLEmbedder
+        model = _get_qwen3vl_model()
+        inputs = [{"text": norm, "instruction": VIDEO_EMBED_INSTRUCTION}]
+        with torch.inference_mode():
+            emb = model.process(inputs)  # (1, 2048) torch tensor, L2-normalized
+        # Truncate to 1024d (MRL) + re-normalize
+        emb = emb[:, :1024]
+        emb = emb / emb.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        emb_np = emb.cpu().float().numpy()
+
+    cache.set_embedding(f"video|{cache_key}", emb_np)
+    return emb_np.tolist()[0]
+
+
+@app.route('/api/search-video', methods=['POST'])
+def search_video():
+    """Text-to-video search using Qwen3-VL-Embedding."""
+    data = request.json
+    query = data.get('query', '')
+    top_k = data.get('top_k', 10)
+
+    if not query:
+        return jsonify({'error': 'Query is required'}), 400
+
+    t_start = time.perf_counter()
+
+    # 1. Result cache check
+    cache_key = f"{normalize_query(query)}|k={top_k}"
+    cached = cache.get_results('video', cache_key, top_k)
+    if cached is not None:
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        return jsonify({'results': cached, 'cache': 'HIT', 'latency_ms': round(elapsed_ms, 2)})
+
+    # 2. Embed + search qwen3vl collection
+    try:
+        query_vector = embed_text_for_video(query)
+    except Exception as e:
+        return jsonify({'error': f'Failed to embed query: {e}'}), 500
+
+    try:
+        search_response = qdrant.query_points(
+            collection_name=VIDEO_COLLECTION,
+            query=query_vector,
+            limit=top_k,
+            with_payload=True,
+            search_params=_search_params(),
+        )
+        search_result = search_response.points
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    results = []
+    for rank, hit in enumerate(search_result):
+        payload = hit.payload or {}
+        vid_id = payload.get('image_id', str(hit.id))
+        # Strip Kaggle mount + dataset-slug prefixes so the URL works
+        # both on Kaggle and locally (serve_video has its own fallback too).
+        vid_relative = clean_image_path(payload.get('image_path', vid_id))
+        for prefix in ("datasets/anhpham2710/my-videos-test/", "datasets/", "anhpham2710/my-videos-test/"):
+            if vid_relative.startswith(prefix):
+                vid_relative = vid_relative[len(prefix):]
+                break
+        results.append({
+            'rank': rank + 1,
+            'video_id': vid_id,
+            'video_url': f"/videos/{vid_relative}",
+            'score': hit.score,
+        })
+
+    cache.set_results('video', cache_key, results, top_k)
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    return jsonify({'results': results, 'cache': 'MISS', 'latency_ms': round(elapsed_ms, 2)})
+
+
+@app.route('/videos/<path:filepath>')
+def serve_video(filepath):
+    """Serve a video file from DATASET_ROOT.
+
+    The notebook stored video_ids relative to /kaggle/input/datasets/<slug>/,
+    so the request path may carry a Kaggle-specific prefix like
+    "datasets/anhpham2710/my-videos-test/test/...". Strip known prefixes
+    and try a few candidate roots; return the first match.
+    """
+    # Strip Kaggle mount / dataset-slug prefix from the front of the path
+    p = filepath.replace("\\", "/")
+    for prefix in (
+        "datasets/anhpham2710/my-videos-test/",
+        "datasets/",
+        "anhpham2710/my-videos-test/",
+    ):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+
+    candidates = [
+        DATASET_ROOT / p,
+        DATASET_ROOT / "videos" / p,
+        DATASET_ROOT / "videos" / "UCF101_subset" / p,
+    ]
+    for full_path in candidates:
+        if full_path.exists() and full_path.is_file():
+            response = send_from_directory(full_path.parent, full_path.name, conditional=True)
+            response.headers['Cache-Control'] = 'public, max-age=86400, immutable'
+            response.headers['Accept-Ranges'] = 'bytes'   # required for HTML5 video seek
+            return response
+    return jsonify({'error': 'Video not found', 'tried': [str(x) for x in candidates]}), 404
 
 
 @app.route('/images/<path:filepath>')

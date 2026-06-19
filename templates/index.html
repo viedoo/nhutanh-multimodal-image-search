@@ -3,18 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Image Search - SigLIP 2</title>
+    <title>Multimodal Search - SigLIP 2 + Qwen3-VL</title>
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>Image Search Engine</h1>
-            <p>Powered by SigLIP 2 + FAISS</p>
+            <h1>Multimodal Search</h1>
+            <p>Powered by SigLIP 2 / DINOv3 / <strong>Qwen3-VL-Embedding</strong></p>
         </header>
 
         <div class="search-box">
-            <input type="text" id="searchInput" placeholder="Enter your search query (e.g., 'cute cat', 'dog playing')">
+            <select id="modeSelect" title="Search mode">
+                <option value="image">Image</option>
+                <option value="video">Video</option>
+            </select>
+            <input type="text" id="searchInput" placeholder="Enter your search query (e.g., 'a woman applying lipstick', 'archery')">
             <button id="searchBtn">Search</button>
         </div>
 

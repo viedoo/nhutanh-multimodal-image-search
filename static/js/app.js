@@ -1,5 +1,6 @@
 const searchInput = document.getElementById('searchInput');
 const searchBtn = document.getElementById('searchBtn');
+const modeSelect = document.getElementById('modeSelect');
 const loading = document.getElementById('loading');
 const error = document.getElementById('error');
 const results = document.getElementById('results');
@@ -7,6 +8,15 @@ const results = document.getElementById('results');
 searchBtn.addEventListener('click', performSearch);
 searchInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') performSearch();
+});
+
+// Placeholder text adapts to selected mode
+const PLACEHOLDERS = {
+    image: "Enter your search query (e.g., 'cute cat', 'dog playing')",
+    video: "Describe a scene (e.g., 'a woman applying lipstick', 'archery')",
+};
+modeSelect.addEventListener('change', () => {
+    searchInput.placeholder = PLACEHOLDERS[modeSelect.value] || PLACEHOLDERS.image;
 });
 
 async function performSearch() {
@@ -19,27 +29,35 @@ async function performSearch() {
     loading.classList.remove('hidden');
     error.classList.add('hidden');
     results.innerHTML = '';
-    
-    // Tự động nhận diện convention:
-    //   "Similar to: cat.xxxx.jpg"  → gọi /api/search-similar
-    //   "Material: cat.xxxx.jpg"    → gọi /api/search-similar-material
-    const isSimilarSearch  = query.startsWith('Similar to:');
-    const isMaterialSearch = query.startsWith('Material:');
-    let endpoint = '/api/search';
-    let reqBody = { query: query, top_k: 10 };
-    let refImageId = null;
-    let searchType = 'text';
 
-    if (isSimilarSearch) {
-        refImageId = query.replace('Similar to:', '').trim();
-        endpoint   = '/api/search-similar';
-        reqBody    = { image_id: refImageId, top_k: 10 };
-        searchType = 'similar';
-    } else if (isMaterialSearch) {
-        refImageId = query.replace('Material:', '').trim();
-        endpoint   = '/api/search-similar-material';
-        reqBody    = { image_id: refImageId, top_k: 10 };
-        searchType = 'material';
+    // Mode-driven routing
+    const mode = modeSelect.value;   // 'image' | 'video'
+    let endpoint, reqBody, searchType, refImageId = null;
+
+    if (mode === 'video') {
+        // Video mode = text-to-video via Qwen3-VL-Embedding (no Similar/Material)
+        endpoint = '/api/search-video';
+        reqBody = { query, top_k: 10 };
+        searchType = 'video';
+    } else {
+        // Image mode keeps existing Similar/Material conventions
+        const isSimilarSearch  = query.startsWith('Similar to:');
+        const isMaterialSearch = query.startsWith('Material:');
+        if (isSimilarSearch) {
+            refImageId = query.replace('Similar to:', '').trim();
+            endpoint = '/api/search-similar';
+            reqBody = { image_id: refImageId, top_k: 10 };
+            searchType = 'similar';
+        } else if (isMaterialSearch) {
+            refImageId = query.replace('Material:', '').trim();
+            endpoint = '/api/search-similar-material';
+            reqBody = { image_id: refImageId, top_k: 10 };
+            searchType = 'material';
+        } else {
+            endpoint = '/api/search';
+            reqBody = { query, top_k: 10 };
+            searchType = 'text';
+        }
     }
 
     try {
@@ -48,12 +66,13 @@ async function performSearch() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(reqBody)
         });
-
-        if (!response.ok) throw new Error('Search failed');
-
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.error || 'Search failed');
+        }
         const data = await response.json();
-        // Truyền thêm refImageId và searchType vào để hiển thị card tham chiếu đúng loại
-        displayResults(data.results, refImageId, searchType);
+        displayResults(data.results, refImageId, searchType,
+                        data.reference_image_url, data.latency_ms, data.cache);
     } catch (err) {
         showError('Search failed: ' + err.message);
     } finally {
@@ -63,11 +82,11 @@ async function performSearch() {
 
 async function findSimilar(e) {
     const imageId = e.target.dataset.imageId;
-    
+
     loading.classList.remove('hidden');
     error.classList.add('hidden');
     results.innerHTML = '';
-    
+
     try {
         const response = await fetch('/api/search-similar', {
             method: 'POST',
@@ -116,7 +135,8 @@ async function findMaterial(e) {
     }
 }
 
-function displayResults(items, referenceImageId = null, searchType = 'similar', referenceImageUrl = null) {
+function displayResults(items, referenceImageId = null, searchType = 'text',
+                        referenceImageUrl = null, latencyMs = null, cacheStatus = null) {
     results.innerHTML = '';
 
     if (items.length === 0) {
@@ -124,8 +144,7 @@ function displayResults(items, referenceImageId = null, searchType = 'similar', 
         return;
     }
 
-    // 1. Nếu có referenceImageId, render card tham chiếu TRƯỚC TIÊN.
-    //    Backend trả về URL đã chuẩn hoá qua reference_image_url — không hardcode ở frontend.
+    // 1. Reference card (only for similar/material searches in image mode)
     if (referenceImageId) {
         const refImgUrl = referenceImageUrl || `/images/animals/${referenceImageId}`;
         const refCard = document.createElement('div');
@@ -140,34 +159,55 @@ function displayResults(items, referenceImageId = null, searchType = 'similar', 
         results.appendChild(refCard);
     }
 
-    // 2. Render các kết quả bình thường tiếp theo
+    // 2. Result cards — branch on searchType for image vs video rendering
     items.forEach(item => {
         const card = document.createElement('div');
         card.className = 'result-card';
 
-        card.innerHTML = `
-            <img src="${item.image_url}" alt="${item.image_id}">
-            <div class="result-info">
-                <div class="rank">Rank #${item.rank}</div>
-                <div class="score">Score: ${item.score.toFixed(4)}</div>
-                <div class="image-id">${item.image_id}</div>
-                <div class="action-buttons">
-                    <button class="find-similar-btn" data-image-id="${item.image_id}">Find Similar</button>
-                    <button class="find-material-btn" data-image-id="${item.image_id}">Find Material</button>
+        if (searchType === 'video') {
+            // HTML5 <video controls>; preload="metadata" avoids downloading entire clip on page load
+            card.innerHTML = `
+                <video controls preload="metadata" src="${item.video_url}" class="result-video"></video>
+                <div class="result-info">
+                    <div class="rank">Rank #${item.rank}</div>
+                    <div class="score">Score: ${item.score.toFixed(4)}</div>
+                    <div class="image-id" title="${item.video_id}">${item.video_id.split('/').pop()}</div>
                 </div>
-            </div>
-        `;
-        
+            `;
+        } else {
+            card.innerHTML = `
+                <img src="${item.image_url}" alt="${item.image_id}">
+                <div class="result-info">
+                    <div class="rank">Rank #${item.rank}</div>
+                    <div class="score">Score: ${item.score.toFixed(4)}</div>
+                    <div class="image-id">${item.image_id}</div>
+                    <div class="action-buttons">
+                        <button class="find-similar-btn" data-image-id="${item.image_id}">Find Similar</button>
+                        <button class="find-material-btn" data-image-id="${item.image_id}">Find Material</button>
+                    </div>
+                </div>
+            `;
+        }
+
         results.appendChild(card);
     });
 
-    // Cập nhật lại event listener cho các nút mới
+    // 3. Re-bind listeners on the freshly-rendered buttons
     document.querySelectorAll('.find-similar-btn').forEach(btn => {
         btn.addEventListener('click', findSimilar);
     });
     document.querySelectorAll('.find-material-btn').forEach(btn => {
         btn.addEventListener('click', findMaterial);
     });
+
+    // 4. Optional latency/cache status banner
+    if (latencyMs !== null) {
+        const status = document.createElement('div');
+        status.className = 'search-status';
+        const cacheTxt = cacheStatus ? `${cacheStatus}` : '';
+        status.textContent = `${items.length} results in ${latencyMs.toFixed(1)} ms (${cacheTxt})`;
+        results.prepend(status);
+    }
 }
 
 function showError(message) {
