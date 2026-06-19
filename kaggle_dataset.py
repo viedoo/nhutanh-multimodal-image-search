@@ -16,42 +16,61 @@ import argparse
 import json
 from pathlib import Path
 from kaggle.api.kaggle_api_extended import KaggleApi
-from config import SUPPORTED_IMAGE_EXTENSIONS
+from config import SUPPORTED_IMAGE_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS
 
 
 def validate_dataset_folder(folder: Path) -> dict:
     """
     Validate dataset folder and return statistics.
-    
+    Supports both image and video datasets (mixed).
+
     Returns:
-        dict with keys: total_images, total_size_mb, subdirs, sample_files
+        dict with keys: total_files, total_size_mb, subdirs, sample_files, file_kind
     """
     if not folder.exists():
         raise FileNotFoundError(f"Dataset folder not found: {folder}")
-    
+
     if not folder.is_dir():
         raise ValueError(f"Path is not a directory: {folder}")
-    
-    # Scan for images
-    image_files = []
-    for ext in SUPPORTED_IMAGE_EXTENSIONS:
-        image_files.extend(folder.rglob(f"*{ext}"))
-    
-    if not image_files:
+
+    # Scan for images OR videos. Skip _extra/ subfolders (used by
+    # download_videos.py to park capped-out files locally — they should
+    # never be re-uploaded to Kaggle).
+    media_files = []
+    for ext in SUPPORTED_IMAGE_EXTENSIONS | SUPPORTED_VIDEO_EXTENSIONS:
+        for f in folder.rglob(f"*{ext}"):
+            if "_extra" not in f.relative_to(folder).parts:
+                media_files.append(f)
+
+    if not media_files:
         raise ValueError(
-            f"No images found in {folder}\n"
-            f"Supported extensions: {', '.join(SUPPORTED_IMAGE_EXTENSIONS)}"
+            f"No media files found in {folder}\n"
+            f"Supported image: {', '.join(sorted(SUPPORTED_IMAGE_EXTENSIONS))}\n"
+            f"Supported video: {', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))}"
         )
-    
+
     # Calculate statistics
-    total_size = sum(f.stat().st_size for f in image_files)
-    subdirs = set(f.parent.relative_to(folder) for f in image_files if f.parent != folder)
-    
+    total_size = sum(f.stat().st_size for f in media_files)
+    subdirs = set(f.parent.relative_to(folder) for f in media_files if f.parent != folder)
+
+    # Detect file kind
+    image_count = sum(1 for f in media_files if f.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS)
+    video_count = sum(1 for f in media_files if f.suffix.lower() in SUPPORTED_VIDEO_EXTENSIONS)
+    if video_count > 0 and image_count == 0:
+        kind = "video"
+    elif image_count > 0 and video_count == 0:
+        kind = "image"
+    else:
+        kind = "mixed"
+
     # Get sample files for verification
-    sample_files = [str(f.relative_to(folder)) for f in image_files[:5]]
-    
+    sample_files = [str(f.relative_to(folder)) for f in media_files[:5]]
+
     return {
-        "total_images": len(image_files),
+        "total_files": len(media_files),
+        "total_images": image_count,
+        "total_videos": video_count,
+        "file_kind": kind,
         "total_size_mb": total_size / (1024 ** 2),
         "subdirs": sorted([str(d) for d in subdirs]),
         "sample_files": sample_files,
@@ -68,8 +87,15 @@ def upload_dataset(api, folder, slug=None, public=False, version_notes="Updated 
     # Validate dataset
     print(f"[UPLOAD] Validating dataset folder: {folder}")
     stats = validate_dataset_folder(folder)
-    
-    print(f"  Found {stats['total_images']} images ({stats['total_size_mb']:.1f} MB)")
+
+    label = {
+        "video": "videos",
+        "image": "images",
+        "mixed": "media files",
+    }[stats["file_kind"]]
+    print(f"  Found {stats['total_files']} {label} ({stats['total_size_mb']:.1f} MB)")
+    if stats["file_kind"] == "mixed":
+        print(f"    {stats['total_images']} images, {stats['total_videos']} videos")
     if stats['subdirs']:
         print(f"  Subdirectories: {len(stats['subdirs'])} ({', '.join(stats['subdirs'][:3])}{'...' if len(stats['subdirs']) > 3 else ''})")
     print(f"  Sample files:")

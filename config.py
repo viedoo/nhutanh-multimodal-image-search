@@ -63,7 +63,7 @@ MODELS = {
         "model_id": "Qwen/Qwen3-VL-Embedding-2B",
         "requires_hf_token": False,
         "embedding_dim": 1024,
-        "load_via_sentence_transformers": True,
+        "uses_qwen3vl_embedder": True,
     },
 }
 
@@ -79,6 +79,7 @@ OUTPUT_PATTERNS = {
 
 # Dataset validation
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"}
 
 def get_model_config(model_type: str) -> dict:
     """Get configuration for a specific model type"""

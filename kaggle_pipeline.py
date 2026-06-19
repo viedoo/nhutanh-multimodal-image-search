@@ -293,7 +293,7 @@ def download_outputs(api, tracking_data):
 
 def main():
     parser = argparse.ArgumentParser(description="Kaggle Pipeline - Auto-detects dataset structure")
-    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3", "dinov3_dense"],
+    parser.add_argument("--type", required=True, choices=["siglip2", "dinov3", "dinov3_dense", "qwen3vl"],
                        help="Model type to run")
     parser.add_argument("--upload-dataset", default=None,
                        help="Local dataset folder to upload (e.g., 'dataset')")
