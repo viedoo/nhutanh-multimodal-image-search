@@ -70,6 +70,7 @@ COLLECTIONS = {
     "siglip2": {"prefix": "siglip2_embeddings_", "dim": 768},
     "dinov3": {"prefix": "dinov3_embeddings_", "dim": 768},
     "dinov3_dense": {"prefix": "dinov3_dense_embeddings_", "dim": 768},
+    "qwen3vl": {"prefix": "qwen3vl_embeddings_", "dim": 1024},
 }
 
 HDF5_CHUNK_ROWS = 1024  # how many rows to read at once from HDF5

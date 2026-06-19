@@ -1,7 +1,7 @@
 [project]
 name = "multimodal-image-search"
 version = "1.1.0"
-description = "Multimodal image search engine using SigLIP2 and DINOv3 with Kaggle GPU pipeline and Qdrant"
+description = "Multimodal image & video search engine using SigLIP2, DINOv3 and Qwen3-VL-Embedding with Kaggle GPU pipeline and Qdrant"
 requires-python = ">=3.11"
 dependencies = [
     "cachetools>=7.0.0",
@@ -14,10 +14,13 @@ dependencies = [
     "pillow>=12.2.0",
     "python-dotenv>=1.2.2",
     "qdrant-client>=1.9.0",
+    "qwen-vl-utils>=0.0.14",
     "redis>=8.0.0",
+    "sentence-transformers>=3.0.0",
     "tenacity>=9.0.0",
     "torch>=2.12.0",
+    "torchvision>=0.27.0",
     "tqdm>=4.68.0",
-    "transformers>=4.49,<5",
+    "transformers>=4.57.0,<5",
     "waitress>=3.0.0",
 ]

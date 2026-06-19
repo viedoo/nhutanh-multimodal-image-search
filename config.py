@@ -57,6 +57,14 @@ MODELS = {
         "requires_hf_token": True,
         "embedding_dim": 768,
     },
+    "qwen3vl": {
+        "notebook_file": "qwen3-vl-embed.ipynb",
+        "kernel_slug_suffix": "qwen3-vl-embed",
+        "model_id": "Qwen/Qwen3-VL-Embedding-2B",
+        "requires_hf_token": False,
+        "embedding_dim": 1024,
+        "load_via_sentence_transformers": True,
+    },
 }
 
 # Pipeline defaults

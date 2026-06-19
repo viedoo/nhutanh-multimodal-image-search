@@ -4,6 +4,11 @@ dataset/**/*.jpg
 dataset/**/*.jpeg
 dataset/**/*.png
 dataset/**/*.gif
+dataset/**/*.mp4
+dataset/**/*.avi
+dataset/**/*.mov
+dataset/**/*.mkv
+dataset/**/*.webm
 dogs-cats-images/
 
 # Data and model files
